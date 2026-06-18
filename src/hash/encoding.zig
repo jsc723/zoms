@@ -33,7 +33,10 @@ pub fn encode(src: [20]u8, dest: *[32]u8) void {
 
 /// Decodes a 32-byte encoded string back into a 20-byte array in-place.
 /// Returns an error if an invalid character is encountered.
-pub fn decode(src: [32]u8, dest: *[20]u8) !void {
+pub fn decode(src: []const u8, dest: *[20]u8) !void {
+    if (src.len != 32) {
+        return error.SrcLenInvalid;
+    }
     var bit_buf: u40 = 0;
     var bit_count: u6 = 0;
     var dest_idx: usize = 0;
@@ -108,39 +111,39 @@ test "Base32Decode" {
     var d = [_]u8{0} ** 20;
     var out: [20]u8 = undefined;
 
-    try decode("00000000000000000000000000000000".*, &out);
+    try decode("00000000000000000000000000000000", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 1;
-    try decode("00000000000000000000000000000001".*, &out);
+    try decode("00000000000000000000000000000001", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 10;
-    try decode("0000000000000000000000000000000a".*, &out);
+    try decode("0000000000000000000000000000000a", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 20;
-    try decode("0000000000000000000000000000000k".*, &out);
+    try decode("0000000000000000000000000000000k", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 31;
-    try decode("0000000000000000000000000000000v".*, &out);
+    try decode("0000000000000000000000000000000v", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 32;
-    try decode("00000000000000000000000000000010".*, &out);
+    try decode("00000000000000000000000000000010", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 63;
-    try decode("0000000000000000000000000000001v".*, &out);
+    try decode("0000000000000000000000000000001v", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     d[19] = 64;
-    try decode("00000000000000000000000000000020".*, &out);
+    try decode("00000000000000000000000000000020", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 
     // Largest!
     @memset(&d, 0xff);
-    try decode("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv".*, &out);
+    try decode("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", &out);
     try testing.expectEqualSlices(u8, &d, &out);
 }
