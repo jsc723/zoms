@@ -2,7 +2,5 @@
 const std = @import("std");
 const Io = std.Io;
 
-test {
-    _ = @import("hash/hash.zig");
-    _ = @import("hash/encoding.zig");
-}
+pub const hash = @import("hash");
+pub const chunks = @import("chunks/_mod.zig");
