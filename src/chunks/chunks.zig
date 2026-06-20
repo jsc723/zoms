@@ -68,11 +68,11 @@ pub const ChunkWriter = struct {
         };
     }
 
-    pub fn finish(self: *ChunkWriter, allocator: std.mem.Allocator) Chunk {
+    pub fn finish(self: *ChunkWriter) Chunk {
         const buf = if (self.buffer != null) &self.buffer.? else {
             std.debug.panic("chunk writer has already finished", .{});
         };
-        const ownedData = buf.toOwnedSlice(allocator) catch |err| {
+        const ownedData = buf.toOwnedSlice(self.allocator) catch |err| {
             std.debug.panic("chunk writer failed on converting buf's ownership {any}", .{err});
         };
         self.buffer = null;
@@ -80,10 +80,9 @@ pub const ChunkWriter = struct {
         return Chunk.moveInit(ownedData);
     }
 
-    pub fn deinit(self: *ChunkWriter, allocator: std.mem.Allocator) void {
-        if (self.buffer) |buf| {
-            var mutable_buf = buf;
-            mutable_buf.deinit(allocator);
+    pub fn deinit(self: *ChunkWriter) void {
+        if (self.buffer != null) {
+            self.buffer.?.deinit(self.allocator);
             self.buffer = null;
         }
     }
@@ -95,7 +94,10 @@ test "test chunk" {
     const alc = testing.allocator;
     const c0 = try Chunk.init(alc, "123");
     defer c0.deinit(alc);
-    try testing.expectEqualStrings(c0.getData(), "123");
+    try testing.expectEqualStrings(
+        "123",
+        c0.getData(),
+    );
     try testing.expect(!c0.getHash().isEmpty());
 }
 
@@ -105,11 +107,11 @@ test "test chunk writer" {
     writer.write("abc");
     writer.write("123");
     writer.write("日本語");
-    const c = writer.finish(alc);
+    const c = writer.finish();
     defer c.deinit(alc);
     try testing.expectEqualStrings("abc123日本語", c.getData());
 
     var writer2 = ChunkWriter.init(alc);
     writer2.write("aaa");
-    writer2.deinit(alc);
+    writer2.deinit();
 }

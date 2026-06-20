@@ -95,4 +95,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_hash_tests.step);
     test_step.dependOn(&run_chunks_tests.step);
+
+    // for zls
+    const check_step = b.step("check", "Check compilation");
+    check_step.dependOn(&exe.step);
 }
