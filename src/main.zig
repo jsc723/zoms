@@ -5,8 +5,8 @@ const zoms = @import("zoms");
 
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("Hello zig\n", .{});
-    const gpa = init.gpa;
+    std.debug.print("hello zig", .{});
+    const alloc = init.gpa;
     const empty: []const u8 = &.{};
-    gpa.free(empty);
+    alloc.free(empty);
 }

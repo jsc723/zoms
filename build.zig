@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const hash_mod = b.addModule("hash", .{
-        .root_source_file = b.path("src/hash/_mod.zig"),
+        .root_source_file = b.path("src/hash/MOD.zig"),
         .target = target,
     });
     const mod = b.addModule("zoms", .{ .root_source_file = b.path("src/root.zig"), .target = target, .imports = &.{
@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
 
     const hash_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/hash/_mod.zig"),
+            .root_source_file = b.path("src/hash/MOD.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     hash_test_step.dependOn(&run_hash_tests.step);
 
     const chunks_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/chunks/_mod.zig"),
+        .root_source_file = b.path("src/chunks/MOD.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{

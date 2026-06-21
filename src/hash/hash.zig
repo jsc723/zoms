@@ -48,7 +48,7 @@ pub const Hash = struct {
     }
 
     pub fn equals(self: Hash, other: Hash) bool {
-        return self.bytes == other.bytes;
+        return std.mem.eql(u8, &self.bytes, &other.bytes);
     }
 
     pub fn compare(self: Hash, other: Hash) std.math.Order {

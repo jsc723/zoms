@@ -3,4 +3,4 @@ const std = @import("std");
 const Io = std.Io;
 
 pub const hash = @import("hash");
-pub const chunks = @import("chunks/_mod.zig");
+pub const chunks = @import("chunks/MOD.zig");
