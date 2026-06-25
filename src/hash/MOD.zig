@@ -1,4 +1,5 @@
-pub const Hash = @import("hash.zig").Hash;
+const hash = @import("hash.zig");
+pub const Hash = hash.Hash;
 pub const base32 = @import("base32.zig");
 
 test {

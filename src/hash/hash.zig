@@ -54,6 +54,19 @@ pub const Hash = struct {
     pub fn compare(self: Hash, other: Hash) std.math.Order {
         return std.mem.order(u8, self.bytes[0..], other.bytes[0..]);
     }
+
+    pub const Context = HashContext;
+    pub const Set = std.AutoHashMap(Hash, void);
+};
+
+pub const HashContext = struct {
+    pub fn hash(_: HashContext, h: Hash) u64 {
+        return std.hash.Wyhash.hash(0, &h.bytes);
+    }
+
+    pub fn eql(_: HashContext, a: Hash, b: Hash) bool {
+        return a.equals(b);
+    }
 };
 
 test "Hash.ToString fills custom slice correctly" {

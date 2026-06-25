@@ -43,6 +43,14 @@ pub const Chunk = struct {
         };
     }
 
+    pub fn initWithoutOwnership(data: []const u8) Chunk {
+        // same as moveInit, but just be explicit
+        return Chunk{
+            .h = Hash.of(data),
+            .data = data,
+        };
+    }
+
     pub fn deinit(self: *const Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
     }
