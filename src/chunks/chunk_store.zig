@@ -94,12 +94,10 @@ pub fn MemoryStorage(comptime io: std.Io) type {
             };
         }
 
-        pub fn deinit(self: *Self, freeChunks: bool) void {
-            if (freeChunks) {
-                var iter = self.data.valueIterator();
-                while (iter.next()) |pValue| {
-                    pValue.deinit(self.alloc);
-                }
+        pub fn deinit(self: *Self) void {
+            var iter = self.data.valueIterator();
+            while (iter.next()) |pValue| {
+                pValue.deinit(self.alloc);
             }
             self.data.deinit();
         }
@@ -273,7 +271,7 @@ test "test memory storage" {
     const io = testing.io;
     const alloc = testing.allocator;
     var storage = MemoryStorage(io).init(alloc);
-    defer storage.deinit(false);
+    defer storage.deinit();
 
     // initial state
     try testing.expectEqual(0, try storage.len());
@@ -285,7 +283,7 @@ test "test memory storage" {
     defer pending.deinit();
     const datas: [3][]const u8 = .{ "data", "hello", "world" };
     for (datas) |data| {
-        try pending.put(Hash.of(data), Chunk.initWithoutOwnership(data));
+        try pending.put(Hash.of(data), try Chunk.init(alloc, data));
     }
 
     // successful update
@@ -306,7 +304,7 @@ test "test memory storage" {
 
 fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
     // put
-    try store.put(Hash.of("pending"), Chunk.initWithoutOwnership("pending"));
+    try store.put(Hash.of("pending"), try Chunk.init(alloc, "pending"));
 
     // len
     try testing.expectEqual(4, try store.len());
@@ -388,31 +386,18 @@ test "test memory storage view" {
 
     // set up storage with some chunks
     var storage = MemoryStorage(io).init(alloc);
-    defer storage.deinit(false);
+    defer storage.deinit();
     var pending = HashChunkMap.init(alloc);
     defer pending.deinit();
     const datas: [3][]const u8 = .{ "data", "hello", "world" };
     for (datas) |data| {
-        try pending.put(Hash.of(data), Chunk.initWithoutOwnership(data));
+        try pending.put(Hash.of(data), try Chunk.init(alloc, data));
     }
+
     try testing.expect(try storage.update(Hash.of("a"), Hash.Empty, &pending));
 
     var view = MemoryStorageView(io).init(alloc, &storage);
     defer view.deinit();
 
     try testChunkStore(view.asChunkStore(), alloc);
-}
-
-test "test memory storage view with allocation" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var storage = MemoryStorage(io).init(alloc);
-    defer storage.deinit(true);
-     var pending = HashChunkMap.init(alloc);
-    defer pending.deinit();
-    const datas: [3][]const u8 = .{ "data", "hello", "world" };
-    for (datas) |data| {
-        try pending.put(Hash.of(data), try Chunk.init(alloc, data));
-    }
-    try testing.expect(try storage.update(Hash.of("a"), Hash.Empty, &pending));
 }
