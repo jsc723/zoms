@@ -3,7 +3,7 @@ const chunks = @import("chunks.zig");
 const hash = @import("hash");
 const Chunk = chunks.Chunk;
 const Hash = hash.Hash;
-const HashChunkMap = std.AutoHashMap(Hash, Chunk);
+pub const HashChunkMap = std.AutoHashMap(Hash, Chunk);
 const HashSet = Hash.Set;
 
 pub fn ChunkStore(comptime io: std.Io) type {
@@ -401,3 +401,5 @@ test "test memory storage view" {
 
     try testChunkStore(view.asChunkStore(), alloc);
 }
+
+

@@ -13,9 +13,25 @@ pub fn build(b: *std.Build) void {
     const hash_mod = b.addModule("hash", .{
         .root_source_file = b.path("src/hash/MOD.zig"),
         .target = target,
+        .optimize = optimize,
+    });
+    const chunks_mod = b.addModule("chunks", .{
+        .root_source_file = b.path("src/chunks/MOD.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hash", .module = hash_mod },
+        },
+    });
+    const util_mod = b.addModule("util", .{
+        .root_source_file = b.path("src/util/MOD.zig"),
+        .target = target,
+        .optimize = optimize,
     });
     const mod = b.addModule("zoms", .{ .root_source_file = b.path("src/root.zig"), .target = target, .imports = &.{
         .{ .name = "hash", .module = hash_mod },
+        .{ .name = "chunks", .module = chunks_mod },
+        .{ .name = "util", .module = util_mod },
     } });
 
     const exe = b.addExecutable(.{
@@ -59,6 +75,7 @@ pub fn build(b: *std.Build) void {
     const hash_test_step = b.step("test-hash", "Run hash tests only");
     hash_test_step.dependOn(&run_hash_tests.step);
 
+    // ---- chunks test ---- //
     const chunks_test_mod = b.createModule(.{
         .root_source_file = b.path("src/chunks/MOD.zig"),
         .target = target,
@@ -74,6 +91,18 @@ pub fn build(b: *std.Build) void {
     const run_chunks_tests = b.addRunArtifact(chunks_tests);
     const chunks_test_step = b.step("test-chunks", "Run chunks tests only");
     chunks_test_step.dependOn(&run_chunks_tests.step);
+
+    // ---- util test ---- //
+    const util_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/util/MOD.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_util_tests = b.addRunArtifact(util_tests);
+    const util_tests_step = b.step("test-util", "Run util tests only");
+    util_tests_step.dependOn(&run_util_tests.step);
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -95,8 +124,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_hash_tests.step);
     test_step.dependOn(&run_chunks_tests.step);
+    test_step.dependOn(&run_util_tests.step);
+    
 
     // for zls
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
 }
+
