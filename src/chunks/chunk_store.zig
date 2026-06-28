@@ -41,9 +41,9 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn put(self: Self, key: Hash, chunk: Chunk) !void {
+        pub fn put(self: Self, chunk: Chunk) !void {
             return switch (self) {
-                inline else => |m| m.put(key, chunk),
+                inline else => |m| m.put(chunk),
             };
         }
 
@@ -158,6 +158,7 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
         rootHash: Hash,
         mu: std.Io.RwLock,
         storage: *MemoryStorage(io),
+        alloc: std.mem.Allocator,
 
         const Self = @This();
 
@@ -167,6 +168,7 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
                 .rootHash = Hash.Empty,
                 .mu = std.Io.RwLock.init,
                 .storage = storage,
+                .alloc = alloc,
             };
         }
 
@@ -182,9 +184,12 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
             if (self.pending.get(key)) |c| {
-                return c;
+                return try Chunk.init(self.alloc, c.data);
             }
-            return try self.storage.get(key);
+            if (try self.storage.get(key)) |c| {
+                return try Chunk.init(self.alloc, c.data);
+            }
+            return null;
         }
 
         pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
@@ -198,7 +203,7 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
                     chunk = try self.storage.get(pk.*);
                 }
                 if (chunk) |foundChunk| {
-                    try onFound.invoke(foundChunk);
+                    try onFound.invoke(try Chunk.init(self.alloc, foundChunk.data));
                 }
             }
         }
@@ -224,10 +229,10 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             return absentCount;
         }
 
-        pub fn put(self: *Self, key: Hash, chunk: Chunk) !void {
+        pub fn put(self: *Self, chunk: Chunk) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
-            try self.pending.put(key, chunk);
+            try self.pending.put(chunk.h, chunk);
         }
 
         pub fn rebase(self: *Self) !void {
@@ -313,8 +318,22 @@ pub fn JournalStore(comptime io: std.Io) type {
         pub fn get(self: *Self, key: Hash) !?Chunk {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
-            return self.pending.get(key);
-            // todo
+            if (self.pending.get(key)) |val| {
+                return try Chunk.init(self.alloc, val.data);
+            }
+            var it = self.journaledChunks.iterator();
+            while (it.next()) |e| {
+                try self.journalReader.reader.seekTo(e.value_ptr.offset);
+                const data = try self.journalReader.reader.interface.readAlloc(self.alloc, e.value_ptr.size);
+                defer self.alloc.free(data);
+                std.debug.print("[debug] iter journal {s} {s} {d} {d}\n", .{ e.key_ptr.*.toString(), data, e.value_ptr.*.offset, e.value_ptr.*.size });
+            }
+            if (self.journaledChunks.get(key)) |info| {
+                try self.journalReader.reader.seekTo(info.offset);
+                const data = try self.journalReader.reader.interface.readAlloc(self.alloc, info.size);
+                return Chunk.moveInit(data);
+            }
+            return null;
         }
 
         pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
@@ -324,17 +343,20 @@ pub fn JournalStore(comptime io: std.Io) type {
             var iter = keys.keyIterator();
             while (iter.next()) |pk| {
                 if (self.pending.get(pk.*)) |foundChunk| {
-                    try onFound.invoke(foundChunk);
+                    try onFound.invoke(try Chunk.initWithHash(self.alloc, foundChunk.data, pk.*));
                 }
-                // todo
+                if (self.journaledChunks.get(pk.*)) |info| {
+                    try self.journalReader.reader.seekTo(info.offset);
+                    const data = try self.journalReader.reader.interface.readAlloc(self.alloc, info.size);
+                    try onFound.invoke(Chunk.moveInit(data));
+                }
             }
         }
 
         pub fn has(self: *Self, key: Hash) !bool {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
-            // todo
-            return self.pending.contains(key);
+            return self.pending.contains(key) or self.journaledChunks.contains(key);
         }
 
         pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u32 {
@@ -343,20 +365,23 @@ pub fn JournalStore(comptime io: std.Io) type {
             var absentCount: u32 = 0;
             var iter = keys.keyIterator();
             while (iter.next()) |pk| {
-                if (self.pending.contains(pk.*)) {
+                if (self.pending.contains(pk.*) or self.journaledChunks.contains(pk.*)) {
                     continue;
                 }
-                // todo
                 try onAbsent.invoke(pk.*);
                 absentCount += 1;
             }
             return absentCount;
         }
 
-        pub fn put(self: *Self, key: Hash, chunk: Chunk) !void {
+        pub fn put(self: *Self, chunk: Chunk) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
-            try self.pending.put(key, chunk);
+            if (self.journaledChunks.contains(chunk.h)) {
+                return;
+            }
+            std.debug.print("[debug] put {s} {s}\n", .{ chunk.h.toString(), chunk.data });
+            try self.pending.put(chunk.h, chunk);
         }
 
         pub fn rebase(self: *Self) !void {
@@ -375,7 +400,9 @@ pub fn JournalStore(comptime io: std.Io) type {
                                     .size = chunkSize,
                                 };
                             }
-                            try fileReader.interface.discardAll(chunkSize);
+                            const data = try fileReader.interface.readAlloc(closure.store.alloc, chunkSize);
+                            defer closure.store.alloc.free(data);
+                            std.debug.print("[debug] read {s} {s} {d} {d}\n", .{ h.toString(), data, res.value_ptr.offset, res.value_ptr.size });
                         }
                     };
                     var consumer = RebaseChunksConsumer{
@@ -390,7 +417,16 @@ pub fn JournalStore(comptime io: std.Io) type {
                     @panic("not implemented");
                 },
             } else |err| switch (err) {
-                error.EndOfStream => return,
+                error.EndOfStream => {
+                    var it = self.journaledChunks.iterator();
+                    while (it.next()) |e| {
+                        try self.journalReader.reader.seekTo(e.value_ptr.offset);
+                        const data = try self.journalReader.reader.interface.readAlloc(self.alloc, e.value_ptr.size);
+                        defer self.alloc.free(data);
+                        std.debug.print("[debug] iter journal (rebase) {s} {s} {d} {d}\n", .{ e.key_ptr.*.toString(), data, e.value_ptr.*.offset, e.value_ptr.*.size });
+                    }
+                    return;
+                },
                 else => return err,
             }
         }
@@ -409,10 +445,23 @@ pub fn JournalStore(comptime io: std.Io) type {
                 return false;
             }
 
-            try self.journalWriter.writeChunks(self.pending);
+            const WriteChunkCallBack = struct {
+                store: *Self,
+                fn invoke(closure: *@This(), h: Hash, offset: u64, size: u64) !void {
+                    try closure.store.journaledChunks.put(h, .{
+                        .offset = offset,
+                        .size = size,
+                    });
+                }
+            };
+            var cb = WriteChunkCallBack{
+                .store = self,
+            };
+            try self.journalWriter.writeChunks(self.pending, &cb);
             try self.journalWriter.writeRoot(current);
             try self.journalWriter.writer.flush();
             self.clearPending();
+            self.rootHash = current;
 
             return true;
         }
@@ -450,7 +499,7 @@ fn JournalWriter(comptime io: std.Io) type {
             self.alloc.free(self.buffer);
         }
 
-        pub fn writeChunks(self: *Self, chunkSets: HashChunkMap) !void {
+        pub fn writeChunks(self: *Self, chunkSets: HashChunkMap, onChunkWritten: anytype) !void {
             var w = &self.writer.interface;
 
             // type (1)
@@ -463,6 +512,9 @@ fn JournalWriter(comptime io: std.Io) type {
             var it = chunkSets.iterator();
             while (it.next()) |entry| {
                 try chunks.serialize(entry.value_ptr.*, w);
+                const offset = self.writer.logicalPos() - entry.value_ptr.data.len;
+                const size = entry.value_ptr.data.len;
+                try onChunkWritten.invoke(entry.key_ptr.*, offset, size);
                 hashAcc = hashAcc.add(entry.key_ptr.*);
             }
             // hash(number of chunks, chunk1.hash, chunk2.hash, ...) (20)
@@ -586,9 +638,14 @@ test "test memory storage" {
     try testing.expect(std.mem.eql(u8, c.getData(), "data"));
 }
 
-fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
+fn testChunkStore(comptime name: []const u8, store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
     // put
-    try store.put(Hash.of("pending"), try Chunk.init(alloc, "pending"));
+    try store.put(try Chunk.init(alloc, "data"));
+    try store.put(try Chunk.init(alloc, "hello"));
+    try store.put(try Chunk.init(alloc, "world"));
+    //commit
+    try testing.expect(try store.commit(Hash.of("a"), try store.root()));
+    try store.put(try Chunk.init(alloc, "pending"));
 
     // has
     try testing.expect(try store.has(Hash.of("data")));
@@ -599,8 +656,11 @@ fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void
 
     // get
     const data = try store.get(Hash.of("data")) orelse @panic("data is null");
+    defer data.deinit(alloc);
+    std.debug.print("[{s} debug] {s}\n", .{ name, data.data });
     try testing.expect(std.mem.eql(u8, data.getData(), "data"));
     const pending = try store.get(Hash.of("pending")) orelse @panic("data (pending) is null");
+    defer pending.deinit(alloc);
     try testing.expect(std.mem.eql(u8, pending.getData(), "pending"));
 
     // hasMany
@@ -625,7 +685,13 @@ fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void
 
     // getMany
     var found = HashChunkMap.init(alloc);
-    defer found.deinit();
+    defer {
+        var it = found.valueIterator();
+        while(it.next()) |v| {
+            v.deinit(alloc);
+        }
+        found.deinit();
+    }
     var onFound = struct {
         found: *HashChunkMap,
         fn invoke(self: *@This(), chunk: Chunk) !void {
@@ -639,14 +705,19 @@ fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void
     try testing.expect(found.contains(Hash.of("pending")));
 
     try store.rebase();
-    const last = try store.root();
     const current = Hash.of("current");
-    try testing.expect(try store.commit(current, last));
+    try testing.expect(try store.commit(current, try store.root()));
     try testing.expectEqual(current, try store.root());
 
     // getMany2
     var found2 = HashChunkMap.init(alloc);
-    defer found2.deinit();
+    defer {
+        var it = found2.valueIterator();
+        while(it.next()) |v| {
+            v.deinit(alloc);
+        }
+        found2.deinit();
+    }
     var onFound2 = struct {
         found: *HashChunkMap,
         fn invoke(self: *@This(), chunk: Chunk) !void {
@@ -675,11 +746,27 @@ test "test memory storage view" {
     }
 
     try testing.expect(try storage.update(Hash.of("a"), Hash.Empty, &pending));
+}
 
+test "test memory view chunk store" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var storage = MemoryStorage(io).init(alloc);
+    defer storage.deinit();
     var view = MemoryStorageView(io).init(alloc, &storage);
     defer view.deinit();
+    try testChunkStore("memview", view.asChunkStore(), alloc);
+}
 
-    try testChunkStore(view.asChunkStore(), alloc);
+test "test journal chunk store" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const tmpJournalPath = "tmp/testJournalStore/test.zjs";
+    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalStore") catch {};
+    defer store.deinit();
+
+    try testChunkStore("journal", store.asChunkStore(), alloc);
 }
 
 test "test journal writer and reader" {
@@ -703,9 +790,13 @@ test "test journal writer and reader" {
     }
     for (datas) |data| {
         const c = try Chunk.init(alloc, data);
-        try chunkSet.put(Hash.of(data), c);
+        try chunkSet.put(c.h, c);
     }
-    try w.writeChunks(chunkSet);
+    const NoopCB = struct {
+        fn invoke(_: *@This(), _: Hash, _: u64, _: u64) !void {}
+    };
+    var cb = NoopCB{};
+    try w.writeChunks(chunkSet, &cb);
     try w.writeRoot(Hash.of("a"));
     try w.writer.flush();
 
@@ -734,9 +825,9 @@ test "test journal writer and reader" {
 test "test journal store" {
     const io = testing.io;
     const alloc = testing.allocator;
-    const tmpJournalPath = "tmp/testJournalStore/test.zjs";
+    const tmpJournalPath = "tmp/testJournalStore2/test.zjs";
     var store = try JournalStore(io).init(alloc, tmpJournalPath);
-    defer Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     defer store.deinit();
 
     const datas = [_][]const u8{ "hello", "world", "data" };
@@ -750,7 +841,7 @@ test "test journal store" {
     }
     for (datas) |data| {
         const c = try Chunk.init(alloc, data);
-        try store.put(Hash.of(data), c);
+        try store.put(c);
     }
 
     try testing.expect(try store.commit(Hash.of("a"), try store.root()));
