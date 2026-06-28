@@ -15,18 +15,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const util_mod = b.addModule("util", .{
+        .root_source_file = b.path("src/util/MOD.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const chunks_mod = b.addModule("chunks", .{
         .root_source_file = b.path("src/chunks/MOD.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hash", .module = hash_mod },
+            .{ .name = "util", .module = util_mod },
         },
-    });
-    const util_mod = b.addModule("util", .{
-        .root_source_file = b.path("src/util/MOD.zig"),
-        .target = target,
-        .optimize = optimize,
     });
     const mod = b.addModule("zoms", .{ .root_source_file = b.path("src/root.zig"), .target = target, .imports = &.{
         .{ .name = "hash", .module = hash_mod },
@@ -82,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hash", .module = hash_mod },
+            .{ .name = "util", .module = util_mod },
         },
     });
     const chunks_tests = b.addTest(.{
@@ -125,10 +127,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_hash_tests.step);
     test_step.dependOn(&run_chunks_tests.step);
     test_step.dependOn(&run_util_tests.step);
-    
 
     // for zls
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
 }
-

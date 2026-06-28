@@ -1,3 +1,5 @@
 noms
 zig-out
 .zig-cache
+tmp
+data
