@@ -47,12 +47,6 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn len(self: Self) !u64 {
-            return switch (self) {
-                inline else => |m| m.len(),
-            };
-        }
-
         pub fn rebase(self: Self) !void {
             return switch (self) {
                 inline else => |m| m.rebase(),
@@ -236,12 +230,6 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             try self.pending.put(key, chunk);
         }
 
-        pub fn len(self: *Self) !u64 {
-            try self.mu.lockShared(io);
-            defer self.mu.unlockShared(io);
-            return self.pending.count() + try self.storage.len();
-        }
-
         pub fn rebase(self: *Self) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
@@ -285,7 +273,6 @@ pub fn JournalStore(comptime io: std.Io) type {
         rootHash: Hash,
         mu: std.Io.RwLock,
         alloc: std.mem.Allocator,
-        storedCount: u64,
         journal: File,
         journalReader: JournalReader(io),
         journalWriter: JournalWriter(io),
@@ -300,7 +287,6 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .rootHash = Hash.Empty,
                 .mu = std.Io.RwLock.init,
                 .alloc = alloc,
-                .storedCount = 0,
                 .journal = journal,
                 .journalReader = try .init(alloc, journal),
                 .journalWriter = try .init(alloc, journal),
@@ -373,13 +359,6 @@ pub fn JournalStore(comptime io: std.Io) type {
             try self.pending.put(key, chunk);
         }
 
-        pub fn len(self: *Self) !u64 {
-            try self.mu.lockShared(io);
-            defer self.mu.unlockShared(io);
-            // todo
-            return self.pending.count() + self.storedCount;
-        }
-
         pub fn rebase(self: *Self) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
@@ -391,7 +370,6 @@ pub fn JournalStore(comptime io: std.Io) type {
                         fn invoke(closure: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
                             const res = try closure.store.journaledChunks.getOrPut(h);
                             if (!res.found_existing) {
-                                closure.store.storedCount += 1;
                                 res.value_ptr.* = ChunkInfo{
                                     .offset = fileReader.logicalPos(),
                                     .size = chunkSize,
@@ -549,7 +527,11 @@ fn JournalReader(comptime io: std.Io) type {
                 //size
                 const chunkSize = try r.takeInt(u32, .big);
                 //data
+                const expectPos = self.reader.logicalPos() + chunkSize;
                 try chunkConsumer.invoke(h, chunkSize, &self.reader);
+                if (self.reader.logicalPos() != expectPos) {
+                    @panic("read chunk contract is violated");
+                }
             }
             const readHashAcc = try Hash.fromReader(r);
             if (!readHashAcc.equals(hashAcc)) {
@@ -608,9 +590,6 @@ fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void
     // put
     try store.put(Hash.of("pending"), try Chunk.init(alloc, "pending"));
 
-    // len
-    try testing.expectEqual(4, try store.len());
-
     // has
     try testing.expect(try store.has(Hash.of("data")));
     try testing.expect(try store.has(Hash.of("hello")));
@@ -664,7 +643,6 @@ fn testChunkStore(store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void
     const current = Hash.of("current");
     try testing.expect(try store.commit(current, last));
     try testing.expectEqual(current, try store.root());
-    try testing.expectEqual(4, store.len());
 
     // getMany2
     var found2 = HashChunkMap.init(alloc);
@@ -781,5 +759,4 @@ test "test journal store" {
     var store2 = try JournalStore(io).init(alloc, tmpJournalPath);
     defer store2.deinit();
     try store2.rebase();
-    try testing.expectEqual(datas.len, try store2.len());
 }
