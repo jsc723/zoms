@@ -276,14 +276,20 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
 // JournalStore assume only one instance of JournalStore will have access to the underlying journel file.
 // This means you cannot have multiple processes writing to the same journel file otherwise your file get corrupted.
 pub fn JournalStore(comptime io: std.Io) type {
+    const ChunkInfo = struct {
+        offset: u64,
+        size: u64,
+    };
     return struct {
         pending: HashChunkMap,
         rootHash: Hash,
         mu: std.Io.RwLock,
+        alloc: std.mem.Allocator,
+        storedCount: u64,
         journal: File,
         journalReader: JournalReader(io),
         journalWriter: JournalWriter(io),
-        journaledChunks: std.AutoHashMap(Hash, u64),
+        journaledChunks: std.AutoHashMap(Hash, ChunkInfo),
 
         const Self = @This();
 
@@ -293,9 +299,11 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .pending = HashChunkMap.init(alloc),
                 .rootHash = Hash.Empty,
                 .mu = std.Io.RwLock.init,
+                .alloc = alloc,
+                .storedCount = 0,
                 .journal = journal,
-                .journalReader = .init(alloc, journal),
-                .journalWriter = .init(alloc, journal),
+                .journalReader = try .init(alloc, journal),
+                .journalWriter = try .init(alloc, journal),
                 .journaledChunks = .init(alloc),
             };
 
@@ -304,9 +312,11 @@ pub fn JournalStore(comptime io: std.Io) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.clearPending();
             self.pending.deinit();
             self.journalReader.deinit();
             self.journalWriter.deinit();
+            self.journaledChunks.deinit();
             self.journal.close(io);
         }
 
@@ -367,7 +377,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
             // todo
-            return self.pending.count();
+            return self.pending.count() + self.storedCount;
         }
 
         pub fn rebase(self: *Self) !void {
@@ -375,9 +385,32 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer self.mu.unlock(io);
             try self.journalReader.reader.seekTo(0);
             while (self.journalReader.peekType()) |nextType| switch (nextType) {
-                .Chunks => {},
-                .Root => {},
-                .Table => {},
+                .Chunks => {
+                    const RebaseChunksConsumer = struct {
+                        store: *JournalStore(io),
+                        fn invoke(closure: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
+                            const res = try closure.store.journaledChunks.getOrPut(h);
+                            if (!res.found_existing) {
+                                closure.store.storedCount += 1;
+                                res.value_ptr.* = ChunkInfo{
+                                    .offset = fileReader.logicalPos(),
+                                    .size = chunkSize,
+                                };
+                            }
+                            try fileReader.interface.discardAll(chunkSize);
+                        }
+                    };
+                    var consumer = RebaseChunksConsumer{
+                        .store = self,
+                    };
+                    try self.journalReader.readChunks(&consumer);
+                },
+                .Root => {
+                    self.rootHash = try self.journalReader.readRoot();
+                },
+                .Table => {
+                    @panic("not implemented");
+                },
             } else |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
@@ -400,8 +433,18 @@ pub fn JournalStore(comptime io: std.Io) type {
 
             try self.journalWriter.writeChunks(self.pending);
             try self.journalWriter.writeRoot(current);
+            try self.journalWriter.writer.flush();
+            self.clearPending();
 
             return true;
+        }
+
+        fn clearPending(self: *Self) void {
+            var it = self.pending.valueIterator();
+            while (it.next()) |pVal| {
+                pVal.deinit(self.alloc);
+            }
+            self.pending.clearAndFree();
         }
     };
 }
@@ -708,4 +751,35 @@ test "test journal writer and reader" {
     try r.readChunks(&consumer);
     const rootRead = try r.readRoot();
     try testing.expectEqual(Hash.of("a"), rootRead);
+}
+
+test "test journal store" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const tmpJournalPath = "tmp/testJournalStore/test.zjs";
+    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
+    defer store.deinit();
+
+    const datas = [_][]const u8{ "hello", "world", "data" };
+    var chunkSet = HashChunkMap.init(alloc);
+    defer {
+        var it = chunkSet.valueIterator();
+        while (it.next()) |pVal| {
+            pVal.deinit(alloc);
+        }
+        chunkSet.deinit();
+    }
+    for (datas) |data| {
+        const c = try Chunk.init(alloc, data);
+        try store.put(Hash.of(data), c);
+    }
+
+    try testing.expect(try store.commit(Hash.of("a"), try store.root()));
+
+    // test rebase
+    var store2 = try JournalStore(io).init(alloc, tmpJournalPath);
+    defer store2.deinit();
+    try store2.rebase();
+    try testing.expectEqual(datas.len, try store2.len());
 }
