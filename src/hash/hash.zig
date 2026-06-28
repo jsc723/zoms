@@ -23,18 +23,34 @@ pub const Hash = struct {
         return true;
     }
 
+    pub fn fromReader(reader: *std.Io.Reader) !Hash {
+        var h = Empty;
+        try reader.*.readSliceAll(&h.bytes);
+        return h;
+    }
+
     pub fn isEmpty(self: Hash) bool {
         return std.mem.eql(u8, &self.bytes, &Empty.bytes);
     }
 
-    pub fn toString(self: Hash, dest: *[StringLen]u8) !void {
-        encoding.encode(self.bytes, dest);
+    pub fn toString(self: Hash) [StringLen]u8 {
+        var dest: [StringLen]u8 = .{0} ** StringLen;
+        encoding.encode(self.bytes, &dest);
+        return dest;
     }
 
     pub fn of(data: []const u8) Hash {
         var h = Hash.Empty;
         // truncate first 20 bytes of blake3 hash (which has 32 bytes). The library does truncate automatically.
         blake3.hash(data, &h.bytes, .{});
+        return h;
+    }
+
+    pub fn ofNumber(comptime T: type, num: T) Hash {
+        var buf: [@sizeOf(T)]u8 = .{0} ** @sizeOf(T);
+        std.mem.writeInt(T, &buf, num, .big);
+        var h = Hash.Empty;
+        blake3.hash(&buf, &h.bytes, .{});
         return h;
     }
 
@@ -53,6 +69,13 @@ pub const Hash = struct {
 
     pub fn compare(self: Hash, other: Hash) std.math.Order {
         return std.mem.order(u8, self.bytes[0..], other.bytes[0..]);
+    }
+
+    pub fn add(self: Hash, other: Hash) Hash {
+        var buf: [ByteLen * 2]u8 = .{0} ** (ByteLen * 2);
+        std.mem.copyForwards(u8, buf[0..ByteLen], self.bytes[0..]);
+        std.mem.copyForwards(u8, buf[ByteLen..], other.bytes[0..]);
+        return Hash.of(&buf);
     }
 
     pub const Context = HashContext;
@@ -74,17 +97,14 @@ test "Hash.ToString fills custom slice correctly" {
     var sample_hash = Hash{ .bytes = [_]u8{0} ** ByteLen };
     sample_hash.bytes[ByteLen - 1] = 1; // Set the last byte so it isn't empty
 
-    // 2. Prepare a destination buffer array on the stack
-    var buf: [StringLen]u8 = undefined;
-
     // Pass it as a slice to ToString
-    try sample_hash.toString(&buf);
+    const str = sample_hash.toString();
 
     // 3. Assert the result matches the encoded output
-    try testing.expectEqualStrings("00000000000000000000000000000001", &buf);
+    try testing.expectEqualStrings("00000000000000000000000000000001", &str);
 }
 
-test "Hash.Of allocation and hashing lifecycle" {
+test "Hash.of" {
     const input_data = "hello world";
 
     // 1. Generate the hash pointer on the heap
@@ -94,9 +114,17 @@ test "Hash.Of allocation and hashing lifecycle" {
     try testing.expect(!hash_ptr.isEmpty());
 
     // 4. Convert the hash to a string and verify its correctness
-    var buf: [StringLen]u8 = undefined;
-    try hash_ptr.toString(&buf);
-    try testing.expectEqualStrings("qt4o3rt71868g2sdhgcobk3lrf5vcudp", &buf);
+    const str = hash_ptr.toString();
+    try testing.expectEqualStrings("qt4o3rt71868g2sdhgcobk3lrf5vcudp", &str);
+}
+
+test "Hash.ofNumber" {
+    const input_data = 42;
+    const hash = Hash.ofNumber(u32, input_data);
+    try testing.expect(!hash.isEmpty());
+    try testing.expect(hash.equals(Hash.ofNumber(u32, 42)));
+    try testing.expect(!hash.equals(Hash.ofNumber(u32, 4111)));
+    try testing.expect(!hash.equals(Hash.ofNumber(u8, 42)));
 }
 
 test "test is empty" {
@@ -172,4 +200,13 @@ test "Hash.Compare all zero and all ff" {
 
     try testing.expectEqual(std.math.Order.lt, zero.compare(ff));
     try testing.expectEqual(std.math.Order.gt, ff.compare(zero));
+}
+
+test "hash add" {
+    const a = Hash.of("a");
+    const b = Hash.of("b");
+    const res = Hash.add(a, b);
+    try testing.expect(!res.isEmpty());
+    try testing.expect(!a.equals(res));
+    try testing.expect(!b.equals(res));
 }

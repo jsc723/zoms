@@ -1,4 +1,8 @@
 const std = @import("std");
+const Dir = std.Io.Dir;
+const File = std.Io.File;
+const path = std.Io.Dir.path;
+const openOrCreateFile = @import("util").file.openOrCreateFile;
 const chunks = @import("chunks.zig");
 const hash = @import("hash");
 const Chunk = chunks.Chunk;
@@ -9,7 +13,10 @@ const HashSet = Hash.Set;
 pub fn ChunkStore(comptime io: std.Io) type {
     return union(enum) {
         const Self = @This();
+
         memoryStoreView: *MemoryStorageView(io),
+        journalStore: *JournalStore(io),
+
         pub fn has(self: Self, h: Hash) !bool {
             return switch (self) {
                 inline else => |m| m.has(h),
@@ -40,7 +47,7 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn len(self: Self) !u32 {
+        pub fn len(self: Self) !u64 {
             return switch (self) {
                 inline else => |m| m.len(),
             };
@@ -114,7 +121,7 @@ pub fn MemoryStorage(comptime io: std.Io) type {
             return self.data.contains(h);
         }
 
-        pub fn len(self: *Self) !u32 {
+        pub fn len(self: *Self) !u64 {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
             return self.data.count();
@@ -229,7 +236,7 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             try self.pending.put(key, chunk);
         }
 
-        pub fn len(self: *Self) !u32 {
+        pub fn len(self: *Self) !u64 {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
             return self.pending.count() + try self.storage.len();
@@ -262,6 +269,258 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             }
             self.rootHash = try self.storage.root();
             return success;
+        }
+    };
+}
+
+// JournalStore assume only one instance of JournalStore will have access to the underlying journel file.
+// This means you cannot have multiple processes writing to the same journel file otherwise your file get corrupted.
+pub fn JournalStore(comptime io: std.Io) type {
+    return struct {
+        pending: HashChunkMap,
+        rootHash: Hash,
+        mu: std.Io.RwLock,
+        journal: File,
+        journalReader: JournalReader(io),
+        journalWriter: JournalWriter(io),
+        journaledChunks: std.AutoHashMap(Hash, u64),
+
+        const Self = @This();
+
+        pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
+            const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
+            var self = Self{
+                .pending = HashChunkMap.init(alloc),
+                .rootHash = Hash.Empty,
+                .mu = std.Io.RwLock.init,
+                .journal = journal,
+                .journalReader = .init(alloc, journal),
+                .journalWriter = .init(alloc, journal),
+                .journaledChunks = .init(alloc),
+            };
+
+            try self.rebase();
+            return self;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.pending.deinit();
+            self.journalReader.deinit();
+            self.journalWriter.deinit();
+            self.journal.close(io);
+        }
+
+        pub fn asChunkStore(self: *Self) ChunkStore(io) {
+            return .{ .journalStore = self };
+        }
+
+        pub fn get(self: *Self, key: Hash) !?Chunk {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+            return self.pending.get(key);
+            // todo
+        }
+
+        pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+
+            var iter = keys.keyIterator();
+            while (iter.next()) |pk| {
+                if (self.pending.get(pk.*)) |foundChunk| {
+                    try onFound.invoke(foundChunk);
+                }
+                // todo
+            }
+        }
+
+        pub fn has(self: *Self, key: Hash) !bool {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+            // todo
+            return self.pending.contains(key);
+        }
+
+        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u32 {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+            var absentCount: u32 = 0;
+            var iter = keys.keyIterator();
+            while (iter.next()) |pk| {
+                if (self.pending.contains(pk.*)) {
+                    continue;
+                }
+                // todo
+                try onAbsent.invoke(pk.*);
+                absentCount += 1;
+            }
+            return absentCount;
+        }
+
+        pub fn put(self: *Self, key: Hash, chunk: Chunk) !void {
+            try self.mu.lock(io);
+            defer self.mu.unlock(io);
+            try self.pending.put(key, chunk);
+        }
+
+        pub fn len(self: *Self) !u64 {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+            // todo
+            return self.pending.count();
+        }
+
+        pub fn rebase(self: *Self) !void {
+            try self.mu.lock(io);
+            defer self.mu.unlock(io);
+            try self.journalReader.reader.seekTo(0);
+            while (self.journalReader.peekType()) |nextType| switch (nextType) {
+                .Chunks => {},
+                .Root => {},
+                .Table => {},
+            } else |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            }
+        }
+
+        pub fn root(self: *Self) !Hash {
+            try self.mu.lockShared(io);
+            defer self.mu.unlockShared(io);
+            return self.rootHash;
+        }
+
+        pub fn commit(self: *Self, current: Hash, last: Hash) !bool {
+            try self.mu.lock(io);
+            defer self.mu.unlock(io);
+
+            if (!last.equals(self.rootHash)) {
+                return false;
+            }
+
+            try self.journalWriter.writeChunks(self.pending);
+            try self.journalWriter.writeRoot(current);
+
+            return true;
+        }
+    };
+}
+
+const JournalRecordType = enum { Chunks, Table, Root };
+
+fn JournalWriter(comptime io: std.Io) type {
+    return struct {
+        const Self = @This();
+        writer: std.Io.File.Writer,
+        alloc: std.mem.Allocator,
+        buffer: []u8,
+
+        pub fn init(alloc: std.mem.Allocator, file: std.Io.File) !Self {
+            const buffer = try alloc.alloc(u8, 4096);
+            const writer = file.writer(io, buffer);
+            return .{
+                .writer = writer,
+                .alloc = alloc,
+                .buffer = buffer,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.alloc.free(self.buffer);
+        }
+
+        pub fn writeChunks(self: *Self, chunkSets: HashChunkMap) !void {
+            var w = &self.writer.interface;
+
+            // type (1)
+            try w.writeByte(@intFromEnum(JournalRecordType.Chunks));
+            // number of chunks (4)
+            const chunkCount = chunkSets.count();
+            try w.writeInt(u32, chunkCount, .big);
+            var hashAcc = Hash.ofNumber(u32, chunkCount);
+            // chunks
+            var it = chunkSets.iterator();
+            while (it.next()) |entry| {
+                try chunks.serialize(entry.value_ptr.*, w);
+                hashAcc = hashAcc.add(entry.key_ptr.*);
+            }
+            // hash(number of chunks, chunk1.hash, chunk2.hash, ...) (20)
+            try w.writeAll(&hashAcc.bytes);
+        }
+
+        pub fn writeRoot(self: *Self, root: Hash) !void {
+            var w = &self.writer.interface;
+            // type (1)
+            try w.writeByte(@intFromEnum(JournalRecordType.Root));
+            // root hash (20)
+            try w.writeAll(&root.bytes);
+        }
+    };
+}
+
+fn JournalReader(comptime io: std.Io) type {
+    return struct {
+        const Self = @This();
+
+        reader: std.Io.File.Reader,
+        alloc: std.mem.Allocator,
+        buffer: []u8,
+
+        pub fn init(alloc: std.mem.Allocator, file: std.Io.File) !Self {
+            const buffer = try alloc.alloc(u8, 4096);
+            const reader = file.reader(io, buffer);
+            return .{
+                .reader = reader,
+                .alloc = alloc,
+                .buffer = buffer,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.alloc.free(self.buffer);
+        }
+
+        pub fn peekType(self: *Self) !JournalRecordType {
+            var r = &self.reader.interface;
+            const typeByte = try r.peekByte();
+            return @enumFromInt(typeByte);
+        }
+
+        // !! chunkConsumer must consume the chunk, either by read it or discard it. !!
+        pub fn readChunks(self: *Self, chunkConsumer: anytype) !void {
+            var r = &self.reader.interface;
+            // type (1)
+            const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
+            if (recordType != .Chunks) {
+                return error.ReadChunksTypeMismatch;
+            }
+            // number of chunks (4)
+            const chunkCount = try r.takeInt(u32, .big);
+            var hashAcc = Hash.ofNumber(u32, chunkCount);
+
+            var i: u32 = 0;
+            while (i < chunkCount) : (i += 1) {
+                //hash
+                const h = try Hash.fromReader(r);
+                hashAcc = hashAcc.add(h);
+                //size
+                const chunkSize = try r.takeInt(u32, .big);
+                //data
+                try chunkConsumer.invoke(h, chunkSize, &self.reader);
+            }
+            const readHashAcc = try Hash.fromReader(r);
+            if (!readHashAcc.equals(hashAcc)) {
+                return error.ChunksCorrupted;
+            }
+        }
+
+        pub fn readRoot(self: *Self) !Hash {
+            var r = &self.reader.interface;
+            const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
+            if (recordType != .Root) {
+                return error.ReadRootTypeMismatch;
+            }
+            return try Hash.fromReader(r);
         }
     };
 }
@@ -402,4 +661,51 @@ test "test memory storage view" {
     try testChunkStore(view.asChunkStore(), alloc);
 }
 
+test "test journal writer and reader" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const tmpJournalPath = "tmp/testJournalWriter/test.zjs";
+    const journal = try openOrCreateFile(io, tmpJournalPath, .{ .allowWrite = true });
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
 
+    var w = try JournalWriter(io).init(alloc, journal);
+    defer w.deinit();
+
+    const datas = [_][]const u8{ "hello", "world", "data" };
+    var chunkSet = HashChunkMap.init(alloc);
+    defer {
+        var it = chunkSet.valueIterator();
+        while (it.next()) |pVal| {
+            pVal.deinit(alloc);
+        }
+        chunkSet.deinit();
+    }
+    for (datas) |data| {
+        const c = try Chunk.init(alloc, data);
+        try chunkSet.put(Hash.of(data), c);
+    }
+    try w.writeChunks(chunkSet);
+    try w.writeRoot(Hash.of("a"));
+    try w.writer.flush();
+
+    var r = try JournalReader(io).init(alloc, journal);
+    defer r.deinit();
+
+    try r.reader.seekTo(0);
+    const ChunkConsumer = struct {
+        chunkSet: *HashChunkMap,
+        fn invoke(self: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
+            var ri = &fileReader.interface;
+            const buf = try testing.allocator.alloc(u8, chunkSize);
+            try ri.readSliceAll(buf);
+            const dataChunk = Chunk.moveInit(buf);
+            defer dataChunk.deinit(alloc);
+            try testing.expect(h.equals(dataChunk.getHash()));
+            try testing.expect(self.chunkSet.contains(h));
+        }
+    };
+    var consumer = ChunkConsumer{ .chunkSet = &chunkSet };
+    try r.readChunks(&consumer);
+    const rootRead = try r.readRoot();
+    try testing.expectEqual(Hash.of("a"), rootRead);
+}
