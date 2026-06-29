@@ -687,7 +687,7 @@ fn testChunkStore(comptime name: []const u8, store: ChunkStore(testing.io), allo
     var found = HashChunkMap.init(alloc);
     defer {
         var it = found.valueIterator();
-        while(it.next()) |v| {
+        while (it.next()) |v| {
             v.deinit(alloc);
         }
         found.deinit();
@@ -713,7 +713,7 @@ fn testChunkStore(comptime name: []const u8, store: ChunkStore(testing.io), allo
     var found2 = HashChunkMap.init(alloc);
     defer {
         var it = found2.valueIterator();
-        while(it.next()) |v| {
+        while (it.next()) |v| {
             v.deinit(alloc);
         }
         found2.deinit();

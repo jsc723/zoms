@@ -131,4 +131,7 @@ pub fn build(b: *std.Build) void {
     // for zls
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
+    check_step.dependOn(&hash_tests.step);
+    check_step.dependOn(&run_chunks_tests.step);
+    check_step.dependOn(&run_util_tests.step);
 }
