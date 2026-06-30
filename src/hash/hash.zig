@@ -78,6 +78,16 @@ pub const Hash = struct {
         return Hash.of(&buf);
     }
 
+    pub fn prefix(self: Hash) u64 {
+        return std.mem.readInt(u64, self.bytes[0..8], .big);
+    }
+
+    pub fn suffix(self: Hash) [12]u8 {
+        var s: [12]u8 = undefined;
+        std.mem.copyForwards(u8, &s, self.bytes[8..]);
+        return s;
+    }
+
     pub const Context = HashContext;
     pub const Set = std.AutoHashMap(Hash, void);
 };
@@ -209,4 +219,20 @@ test "hash add" {
     try testing.expect(!res.isEmpty());
     try testing.expect(!a.equals(res));
     try testing.expect(!b.equals(res));
+}
+
+test "hash prefix suffix" {
+    var a = Hash.Empty;
+    try testing.expectEqual(0, a.prefix());
+
+    a.bytes[7] = 0x34;
+    try testing.expectEqual(0x34, a.prefix());
+    a.bytes[6] = 0x12;
+    try testing.expectEqual(0x1234, a.prefix());
+
+    a.bytes[8] = 0x56;
+    try testing.expectEqual(0x1234, a.prefix());
+    try testing.expectEqual(0x56, a.suffix()[0]);
+    a.bytes[19] = 0x78;
+    try testing.expectEqual(0x78, a.suffix()[11]);
 }

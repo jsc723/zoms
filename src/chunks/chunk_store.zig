@@ -266,13 +266,14 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
     };
 }
 
+const ChunkRef = struct {
+    offset: u64,
+    size: u32,
+};
+
 // JournalStore assume only one instance of JournalStore will have access to the underlying journel file.
 // This means you cannot have multiple processes writing to the same journel file otherwise your file get corrupted.
 pub fn JournalStore(comptime io: std.Io) type {
-    const ChunkInfo = struct {
-        offset: u64,
-        size: u64,
-    };
     return struct {
         pending: HashChunkMap,
         rootHash: Hash,
@@ -281,7 +282,7 @@ pub fn JournalStore(comptime io: std.Io) type {
         journal: File,
         journalReader: JournalReader(io),
         journalWriter: JournalWriter(io),
-        journaledChunks: std.AutoHashMap(Hash, ChunkInfo),
+        journaledChunks: std.AutoHashMap(Hash, ChunkRef),
 
         const Self = @This();
 
@@ -326,7 +327,6 @@ pub fn JournalStore(comptime io: std.Io) type {
                 try self.journalReader.reader.seekTo(e.value_ptr.offset);
                 const data = try self.journalReader.reader.interface.readAlloc(self.alloc, e.value_ptr.size);
                 defer self.alloc.free(data);
-                std.debug.print("[debug] iter journal {s} {s} {d} {d}\n", .{ e.key_ptr.*.toString(), data, e.value_ptr.*.offset, e.value_ptr.*.size });
             }
             if (self.journaledChunks.get(key)) |info| {
                 try self.journalReader.reader.seekTo(info.offset);
@@ -380,7 +380,6 @@ pub fn JournalStore(comptime io: std.Io) type {
             if (self.journaledChunks.contains(chunk.h)) {
                 return;
             }
-            std.debug.print("[debug] put {s} {s}\n", .{ chunk.h.toString(), chunk.data });
             try self.pending.put(chunk.h, chunk);
         }
 
@@ -395,14 +394,13 @@ pub fn JournalStore(comptime io: std.Io) type {
                         fn invoke(closure: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
                             const res = try closure.store.journaledChunks.getOrPut(h);
                             if (!res.found_existing) {
-                                res.value_ptr.* = ChunkInfo{
+                                res.value_ptr.* = ChunkRef{
                                     .offset = fileReader.logicalPos(),
                                     .size = chunkSize,
                                 };
                             }
                             const data = try fileReader.interface.readAlloc(closure.store.alloc, chunkSize);
                             defer closure.store.alloc.free(data);
-                            std.debug.print("[debug] read {s} {s} {d} {d}\n", .{ h.toString(), data, res.value_ptr.offset, res.value_ptr.size });
                         }
                     };
                     var consumer = RebaseChunksConsumer{
@@ -413,7 +411,10 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .Root => {
                     self.rootHash = try self.journalReader.readRoot();
                 },
-                .Table => {
+                .Index => {
+                    @panic("not implemented");
+                },
+                .Header => {
                     @panic("not implemented");
                 },
             } else |err| switch (err) {
@@ -423,7 +424,6 @@ pub fn JournalStore(comptime io: std.Io) type {
                         try self.journalReader.reader.seekTo(e.value_ptr.offset);
                         const data = try self.journalReader.reader.interface.readAlloc(self.alloc, e.value_ptr.size);
                         defer self.alloc.free(data);
-                        std.debug.print("[debug] iter journal (rebase) {s} {s} {d} {d}\n", .{ e.key_ptr.*.toString(), data, e.value_ptr.*.offset, e.value_ptr.*.size });
                     }
                     return;
                 },
@@ -447,7 +447,7 @@ pub fn JournalStore(comptime io: std.Io) type {
 
             const WriteChunkCallBack = struct {
                 store: *Self,
-                fn invoke(closure: *@This(), h: Hash, offset: u64, size: u64) !void {
+                fn invoke(closure: *@This(), h: Hash, offset: u64, size: u32) !void {
                     try closure.store.journaledChunks.put(h, .{
                         .offset = offset,
                         .size = size,
@@ -476,7 +476,69 @@ pub fn JournalStore(comptime io: std.Io) type {
     };
 }
 
-const JournalRecordType = enum { Chunks, Table, Root };
+const Index = struct {
+    const Suffix = [12]u8;
+    const HashRefPair = struct {
+        h: Hash,
+        r: ChunkRef,
+    };
+    count: u64,
+    level: u32,
+    prefixs: []u64,
+    suffixs: []Suffix,
+    refs: []ChunkRef,
+    alloc: std.mem.Allocator,
+
+    pub fn init(alloc: std.mem.Allocator, chunkRefs: std.AutoHashMap(Hash, ChunkRef)) !Index {
+        const count = chunkRefs.count();
+        var pairs = try alloc.alloc(HashRefPair, count);
+        defer alloc.free(pairs);
+        var it = chunkRefs.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| {
+            pairs[i] = .{
+                .h = e.key_ptr.*,
+                .r = e.value_ptr.*,
+            };
+            i += 1;
+        }
+        // sort refs by hash
+
+        std.mem.sortUnstable(HashRefPair, pairs, {}, struct {
+            fn less(_: void, lhs: HashRefPair, rhs: HashRefPair) bool {
+                return lhs.h.compare(rhs.h) == .lt;
+            }
+        }.less);
+        var prefixs = try alloc.alloc(u64, count);
+        errdefer alloc.free(prefixs);
+        var suffixs = try alloc.alloc(Suffix, count);
+        errdefer alloc.free(suffixs);
+        var refs = try alloc.alloc(ChunkRef, count);
+        errdefer alloc.free(refs);
+        i = 0;
+        while (i < pairs.len) : (i += 1) {
+            prefixs[i] = pairs[i].h.prefix();
+            suffixs[i] = pairs[i].h.suffix();
+            refs[i] = pairs[i].r;
+        }
+        return Index{
+            .count = count,
+            .level = 0,
+            .prefixs = prefixs,
+            .suffixs = suffixs,
+            .refs = refs,
+            .alloc = alloc,
+        };
+    }
+
+    pub fn deinit(self: Index) void {
+        self.alloc.free(self.prefixs);
+        self.alloc.free(self.suffixs);
+        self.alloc.free(self.refs);
+    }
+};
+
+const JournalRecordType = enum { Chunks, Index, Root, Header };
 
 fn JournalWriter(comptime io: std.Io) type {
     return struct {
@@ -513,12 +575,69 @@ fn JournalWriter(comptime io: std.Io) type {
             while (it.next()) |entry| {
                 try chunks.serialize(entry.value_ptr.*, w);
                 const offset = self.writer.logicalPos() - entry.value_ptr.data.len;
-                const size = entry.value_ptr.data.len;
+                const size: u32 = @intCast(entry.value_ptr.data.len);
                 try onChunkWritten.invoke(entry.key_ptr.*, offset, size);
                 hashAcc = hashAcc.add(entry.key_ptr.*);
             }
             // hash(number of chunks, chunk1.hash, chunk2.hash, ...) (20)
             try w.writeAll(&hashAcc.bytes);
+        }
+
+        pub fn writeIndex(self: *Self, index: Index) !void {
+            const base_writer = &self.writer.interface;
+            if (index.prefixs.len != index.count) {
+                return error.PrefixLenInvalid;
+            }
+            if (index.refs.len != index.count) {
+                return error.RefsLenInvalid;
+            }
+            if (index.suffix.len != index.count) {
+                return error.SuffixsLenInvalid;
+            }
+            var hasher = std.hash.Crc32.init();
+            const WriterContext = struct {
+                bw: *std.Io.File.Writer.Interface, // adjust to your actual interface type
+                hasher: *std.hash.Crc32,
+
+                fn writeAll(ctx: *@This(), bytes: []const u8) !void {
+                    try ctx.bw.writeAll(bytes);
+                    ctx.hasher.update(bytes);
+                }
+                fn writeByte(ctx: *@This(), byte: u8) !void {
+                    try ctx.bw.writeByte(byte);
+                    ctx.hasher.update(&[_]u8{byte});
+                }
+                fn writeInt(ctx: *@This(), comptime T: type, n: T) !void {
+                    var buf: [@sizeOf(T)]u8 = undefined;
+                    std.mem.writeInt(T, &buf, n, .big);
+                    try ctx.bw.writeAll(&buf);
+                    ctx.hasher.update(&buf);
+                }
+            };
+            var w = WriterContext{ .bw = base_writer, .hasher = &hasher };
+
+            // type (1)
+            try w.writeByte(@intFromEnum(JournalRecordType.Index));
+            // count (8)
+            try w.writeInt(u64, index.count);
+            // level (4)
+            try w.writeInt(u32, index.level);
+            // prefix
+            for (index.prefixs) |prefix| {
+                try w.writeInt(u64, prefix.prefix);
+                try w.writeInt(u32, prefix.order);
+            }
+            // refs
+            for (index.refs) |ref| {
+                try w.write(u64, ref.offset);
+                try w.write(u32, ref.length);
+            }
+            // suffix
+            for (index.suffixs) |suffix| {
+                try w.writeAll(&suffix);
+            }
+            const crc32 = hasher.final();
+            try base_writer.writeInt(u32, crc32, .big);
         }
 
         pub fn writeRoot(self: *Self, root: Hash) !void {
@@ -638,7 +757,7 @@ test "test memory storage" {
     try testing.expect(std.mem.eql(u8, c.getData(), "data"));
 }
 
-fn testChunkStore(comptime name: []const u8, store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
+fn testChunkStore(comptime _: []const u8, store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
     // put
     try store.put(try Chunk.init(alloc, "data"));
     try store.put(try Chunk.init(alloc, "hello"));
@@ -657,7 +776,6 @@ fn testChunkStore(comptime name: []const u8, store: ChunkStore(testing.io), allo
     // get
     const data = try store.get(Hash.of("data")) orelse @panic("data is null");
     defer data.deinit(alloc);
-    std.debug.print("[{s} debug] {s}\n", .{ name, data.data });
     try testing.expect(std.mem.eql(u8, data.getData(), "data"));
     const pending = try store.get(Hash.of("pending")) orelse @panic("data (pending) is null");
     defer pending.deinit(alloc);
@@ -850,4 +968,37 @@ test "test journal store" {
     var store2 = try JournalStore(io).init(alloc, tmpJournalPath);
     defer store2.deinit();
     try store2.rebase();
+}
+
+test "test index init" {
+    const alloc = testing.allocator;
+    var refs = std.AutoHashMap(Hash, ChunkRef).init(alloc);
+    defer refs.deinit();
+    try refs.put(try Hash.parse("00100000000000000000000000000003"), .{
+        .offset = 0,
+        .size = 10,
+    });
+    try refs.put(try Hash.parse("00200000000000000000000000000002"), .{
+        .offset = 10,
+        .size = 20,
+    });
+    try refs.put(try Hash.parse("00300000000000000000000000000001"), .{
+        .offset = 30,
+        .size = 30,
+    });
+    const idx = try Index.init(alloc, refs);
+    defer idx.deinit();
+    try testing.expectEqual(3, idx.count);
+    try testing.expectEqual(3, idx.prefixs.len);
+    try testing.expectEqual(3, idx.suffixs.len);
+    try testing.expectEqual(3, idx.refs.len);
+    try testing.expectEqual(0, idx.refs[0].offset);
+    try testing.expectEqual(10, idx.refs[0].size);
+    try testing.expectEqual(10, idx.refs[1].offset);
+    try testing.expectEqual(20, idx.refs[1].size);
+    try testing.expectEqual(30, idx.refs[2].offset);
+    try testing.expectEqual(30, idx.refs[2].size);
+    try testing.expectEqual(0x3, idx.suffixs[0][11]);
+    try testing.expectEqual(0x2, idx.suffixs[1][11]);
+    try testing.expectEqual(0x1, idx.suffixs[2][11]);
 }
