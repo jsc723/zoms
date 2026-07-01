@@ -271,6 +271,10 @@ const ChunkRef = struct {
     size: u32,
 };
 
+const IndexRef = struct {
+    offset: u64,
+};
+
 // JournalStore assume only one instance of JournalStore will have access to the underlying journel file.
 // This means you cannot have multiple processes writing to the same journel file otherwise your file get corrupted.
 pub fn JournalStore(comptime io: std.Io) type {
@@ -283,20 +287,32 @@ pub fn JournalStore(comptime io: std.Io) type {
         journalReader: JournalReader(io),
         journalWriter: JournalWriter(io),
         journaledChunks: std.AutoHashMap(Hash, ChunkRef),
+        indexRefs: []IndexRef,
 
         const Self = @This();
+        const MaxJournaledChunksCount = 100;
 
         pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
             const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
+            var writer = try JournalWriter(io).init(alloc, journal);
+            errdefer writer.deinit();
+            if (try journal.length(io) == 0) {
+                const placeholderIndex = Index.initEmpty(alloc);
+                try writer.writeIndex(placeholderIndex);
+                try writer.flush();
+            }
+            var reader = try JournalReader(io).init(alloc, journal);
+            errdefer reader.deinit();
             var self = Self{
                 .pending = HashChunkMap.init(alloc),
                 .rootHash = Hash.Empty,
                 .mu = std.Io.RwLock.init,
                 .alloc = alloc,
                 .journal = journal,
-                .journalReader = try .init(alloc, journal),
-                .journalWriter = try .init(alloc, journal),
+                .journalReader = reader,
+                .journalWriter = writer,
                 .journaledChunks = .init(alloc),
+                .indexRefs = &.{},
             };
 
             try self.rebase();
@@ -412,10 +428,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                     self.rootHash = try self.journalReader.readRoot();
                 },
                 .Index => {
-                    @panic("not implemented");
-                },
-                .Header => {
-                    @panic("not implemented");
+                    _ = try self.journalReader.readIndex();
                 },
             } else |err| switch (err) {
                 error.EndOfStream => {
@@ -484,6 +497,7 @@ const Index = struct {
     };
     count: u64,
     level: u32,
+    next: u64,
     prefixs: []u64,
     suffixs: []Suffix,
     refs: []ChunkRef,
@@ -524,6 +538,97 @@ const Index = struct {
         return Index{
             .count = count,
             .level = 0,
+            .next = 0,
+            .prefixs = prefixs,
+            .suffixs = suffixs,
+            .refs = refs,
+            .alloc = alloc,
+        };
+    }
+
+    pub fn initEmpty(alloc: std.mem.Allocator) Index {
+        return Index{
+            .count = 0,
+            .level = 0,
+            .next = 0,
+            .prefixs = &.{},
+            .suffixs = &.{},
+            .refs = &.{},
+            .alloc = alloc,
+        };
+    }
+
+    pub fn initFromReader(alloc: std.mem.Allocator, reader: *std.Io.Reader) !Index {
+        var hasher = std.hash.Crc32.init();
+        const ReaderContext = struct {
+            br: *std.Io.Reader,
+            hasher: *std.hash.Crc32,
+
+            fn readAll(ctx: *@This(), buffer: []u8) !void {
+                try ctx.br.readSliceAll(buffer);
+                ctx.hasher.update(buffer);
+            }
+            fn takeByte(ctx: *@This()) !u8 {
+                const byte = try ctx.br.takeByte();
+                ctx.hasher.update(&[_]u8{byte});
+                return byte;
+            }
+            fn takeInt(ctx: *@This(), comptime T: type) !T {
+                var buf: [@sizeOf(T)]u8 = undefined;
+                try ctx.br.readSliceAll(&buf);
+                ctx.hasher.update(&buf);
+                return std.mem.readInt(T, &buf, .big);
+            }
+        };
+        var r = ReaderContext{ .br = reader, .hasher = &hasher };
+
+        // type
+        const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
+        if (recordType != .Index) {
+            return error.ReadIndexTypeMismatch;
+        }
+        // count
+        const count = try r.takeInt(u64);
+        // level
+        const level = try r.takeInt(u32);
+        // next
+        const next = try r.takeInt(u64);
+
+        var prefixs = try alloc.alloc(u64, count);
+        errdefer alloc.free(prefixs);
+        var suffixs = try alloc.alloc(Suffix, count);
+        errdefer alloc.free(suffixs);
+        var refs = try alloc.alloc(ChunkRef, count);
+        errdefer alloc.free(refs);
+        // prefix
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            prefixs[i] = try r.takeInt(u64);
+        }
+        // suffix
+        i = 0;
+        while (i < count) : (i += 1) {
+            try r.readAll(&suffixs[i]);
+        }
+        // refs
+        i = 0;
+        while (i < count) : (i += 1) {
+            const offset = try r.takeInt(u64);
+            const size = try r.takeInt(u32);
+            refs[i] = .{
+                .offset = offset,
+                .size = size,
+            };
+        }
+        const crc32 = hasher.final();
+        const readCrc32 = try reader.takeInt(u32, .big);
+        if (readCrc32 != crc32) {
+            return error.IndexCrc32NotMatch;
+        }
+        return Index{
+            .count = count,
+            .level = level,
+            .next = next,
             .prefixs = prefixs,
             .suffixs = suffixs,
             .refs = refs,
@@ -538,7 +643,7 @@ const Index = struct {
     }
 };
 
-const JournalRecordType = enum { Chunks, Index, Root, Header };
+const JournalRecordType = enum { Chunks, Index, Root };
 
 fn JournalWriter(comptime io: std.Io) type {
     return struct {
@@ -591,12 +696,12 @@ fn JournalWriter(comptime io: std.Io) type {
             if (index.refs.len != index.count) {
                 return error.RefsLenInvalid;
             }
-            if (index.suffix.len != index.count) {
+            if (index.suffixs.len != index.count) {
                 return error.SuffixsLenInvalid;
             }
             var hasher = std.hash.Crc32.init();
             const WriterContext = struct {
-                bw: *std.Io.File.Writer.Interface, // adjust to your actual interface type
+                bw: *std.Io.Writer,
                 hasher: *std.hash.Crc32,
 
                 fn writeAll(ctx: *@This(), bytes: []const u8) !void {
@@ -622,19 +727,20 @@ fn JournalWriter(comptime io: std.Io) type {
             try w.writeInt(u64, index.count);
             // level (4)
             try w.writeInt(u32, index.level);
+            // next (8)
+            try w.writeInt(u64, index.next);
             // prefix
             for (index.prefixs) |prefix| {
-                try w.writeInt(u64, prefix.prefix);
-                try w.writeInt(u32, prefix.order);
-            }
-            // refs
-            for (index.refs) |ref| {
-                try w.write(u64, ref.offset);
-                try w.write(u32, ref.length);
+                try w.writeInt(u64, prefix);
             }
             // suffix
             for (index.suffixs) |suffix| {
                 try w.writeAll(&suffix);
+            }
+            // refs
+            for (index.refs) |ref| {
+                try w.writeInt(u64, ref.offset);
+                try w.writeInt(u32, ref.size);
             }
             const crc32 = hasher.final();
             try base_writer.writeInt(u32, crc32, .big);
@@ -646,6 +752,10 @@ fn JournalWriter(comptime io: std.Io) type {
             try w.writeByte(@intFromEnum(JournalRecordType.Root));
             // root hash (20)
             try w.writeAll(&root.bytes);
+        }
+
+        pub fn flush(self: *Self) !void {
+            try self.writer.flush();
         }
     };
 }
@@ -717,6 +827,10 @@ fn JournalReader(comptime io: std.Io) type {
                 return error.ReadRootTypeMismatch;
             }
             return try Hash.fromReader(r);
+        }
+
+        pub fn readIndex(self: *Self) !Index {
+            return try Index.initFromReader(self.alloc, &self.reader.interface);
         }
     };
 }
@@ -879,6 +993,7 @@ test "test memory view chunk store" {
 test "test journal chunk store" {
     const io = testing.io;
     const alloc = testing.allocator;
+    Dir.cwd().deleteTree(io, "tmp/testJournalStore") catch {};
     const tmpJournalPath = "tmp/testJournalStore/test.zjs";
     var store = try JournalStore(io).init(alloc, tmpJournalPath);
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStore") catch {};
@@ -890,6 +1005,7 @@ test "test journal chunk store" {
 test "test journal writer and reader" {
     const io = testing.io;
     const alloc = testing.allocator;
+    Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
     const tmpJournalPath = "tmp/testJournalWriter/test.zjs";
     const journal = try openOrCreateFile(io, tmpJournalPath, .{ .allowWrite = true });
     defer Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
@@ -943,6 +1059,7 @@ test "test journal writer and reader" {
 test "test journal store" {
     const io = testing.io;
     const alloc = testing.allocator;
+    Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     const tmpJournalPath = "tmp/testJournalStore2/test.zjs";
     var store = try JournalStore(io).init(alloc, tmpJournalPath);
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
