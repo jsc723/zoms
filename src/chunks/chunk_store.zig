@@ -41,9 +41,10 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn put(self: Self, chunk: Chunk) !void {
+        // putMove takes ownership of chunk
+        pub fn putMove(self: Self, chunk: Chunk) !void {
             return switch (self) {
-                inline else => |m| m.put(chunk),
+                inline else => |m| m.putMove(chunk),
             };
         }
 
@@ -229,7 +230,7 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             return absentCount;
         }
 
-        pub fn put(self: *Self, chunk: Chunk) !void {
+        pub fn putMove(self: *Self, chunk: Chunk) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
             try self.pending.put(chunk.h, chunk);
@@ -385,7 +386,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             return absentCount;
         }
 
-        pub fn put(self: *Self, chunk: Chunk) !void {
+        pub fn putMove(self: *Self, chunk: Chunk) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
             if (self.journaledChunks.contains(chunk.h)) {
@@ -919,12 +920,12 @@ test "test memory storage" {
 
 fn testChunkStore(comptime _: []const u8, store: ChunkStore(testing.io), alloc: std.mem.Allocator) !void {
     // put
-    try store.put(try Chunk.init(alloc, "data"));
-    try store.put(try Chunk.init(alloc, "hello"));
-    try store.put(try Chunk.init(alloc, "world"));
+    try store.putMove(try Chunk.init(alloc, "data"));
+    try store.putMove(try Chunk.init(alloc, "hello"));
+    try store.putMove(try Chunk.init(alloc, "world"));
     //commit
     try testing.expect(try store.commit(Hash.of("a"), try store.root()));
-    try store.put(try Chunk.init(alloc, "pending"));
+    try store.putMove(try Chunk.init(alloc, "pending"));
 
     // has
     try testing.expect(try store.has(Hash.of("data")));
@@ -1122,7 +1123,7 @@ test "test journal store" {
     }
     for (datas) |data| {
         const c = try Chunk.init(alloc, data);
-        try store.put(c);
+        try store.putMove(c);
     }
 
     try testing.expect(try store.commit(Hash.of("a"), try store.root()));
