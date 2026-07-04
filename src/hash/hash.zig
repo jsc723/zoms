@@ -88,6 +88,10 @@ pub const Hash = struct {
         return s;
     }
 
+    pub fn suffixEqual(self: Hash, other: [12]u8) bool {
+        return std.mem.eql(u8, self.bytes[8..], &other);
+    }
+
     pub const Context = HashContext;
     pub const Set = std.AutoHashMap(Hash, void);
 };

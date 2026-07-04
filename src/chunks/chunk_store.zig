@@ -23,7 +23,7 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn hasMany(self: Self, keys: *const HashSet, onAbsent: anytype) !u32 {
+        pub fn hasMany(self: Self, keys: *const HashSet, onAbsent: anytype) !u64 {
             return switch (self) {
                 inline else => |m| m.hasMany(keys, onAbsent),
             };
@@ -215,10 +215,10 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             return self.pending.contains(key) or try self.storage.has(key);
         }
 
-        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u32 {
+        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u64 {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
-            var absentCount: u32 = 0;
+            var absentCount: u64 = 0;
             var iter = keys.keyIterator();
             while (iter.next()) |pk| {
                 if (self.pending.contains(pk.*) or (try self.storage.has(pk.*))) {
@@ -270,6 +270,10 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
 const ChunkRef = struct {
     offset: u64,
     size: u32,
+
+    pub fn isValid(self: ChunkRef) bool {
+        return self.size > 0;
+    }
 };
 
 // JournalStore assume only one instance of JournalStore will have access to the underlying journel file.
@@ -289,7 +293,7 @@ pub fn JournalStore(comptime io: std.Io) type {
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
         const Self = @This();
-        const MaxJournaledChunksCount = 100;
+        const MaxJournaledChunksCount = 1000;
         const MaxPendingSizeInByte = 1 << 20; // 1mb
 
         pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
@@ -337,13 +341,26 @@ pub fn JournalStore(comptime io: std.Io) type {
         pub fn get(self: *Self, key: Hash) !?Chunk {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
+            var r = &self.journalReader.reader;
             if (self.pending.get(key)) |val| {
                 return try Chunk.init(self.alloc, val.data);
             }
             if (self.journaledChunks.get(key)) |info| {
-                try self.journalReader.reader.seekTo(info.offset);
-                const data = try self.journalReader.reader.interface.readAlloc(self.alloc, info.size);
+                try r.seekTo(info.offset);
+                const data = try r.interface.readAlloc(self.alloc, info.size);
                 return Chunk.moveInit(data);
+            }
+            var i = self.indexHeaders.items.len;
+            while (i > 0) {
+                i -= 1;
+                const header = self.indexHeaders.items[i];
+                try r.seekTo(header.offset);
+                const maybeRef = try self.journalReader.searchInIndex(key);
+                if (maybeRef) |ref| {
+                    try r.seekTo(ref.offset);
+                    const data = try r.interface.readAlloc(self.alloc, ref.size);
+                    return Chunk.moveInit(data);
+                }
             }
             return null;
         }
@@ -353,37 +370,152 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer self.mu.unlockShared(io);
 
             var iter = keys.keyIterator();
+            var journaledRefs = std.ArrayList(HashRefPair).empty;
+            defer journaledRefs.deinit(self.alloc);
+            var remaining = std.ArrayList(HashRefPair).empty;
+            defer remaining.deinit(self.alloc);
+            var r = &self.journalReader.reader;
             while (iter.next()) |pk| {
                 if (self.pending.get(pk.*)) |foundChunk| {
                     try onFound.invoke(try Chunk.initWithHash(self.alloc, foundChunk.data, pk.*));
+                } else if (self.journaledChunks.get(pk.*)) |ref| {
+                    try journaledRefs.append(self.alloc, .{
+                        .h = pk.*,
+                        .ref = ref,
+                    });
+                } else {
+                    try remaining.append(self.alloc, .{
+                        .h = pk.*,
+                        .ref = ChunkRef{
+                            .offset = 0,
+                            .size = 0,
+                        },
+                    });
                 }
-                if (self.journaledChunks.get(pk.*)) |info| {
-                    try self.journalReader.reader.seekTo(info.offset);
-                    const data = try self.journalReader.reader.interface.readAlloc(self.alloc, info.size);
-                    try onFound.invoke(Chunk.moveInit(data));
+            }
+            std.mem.sortUnstable(HashRefPair, journaledRefs.items, {}, struct {
+                fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
+                    return a.ref.offset < b.ref.offset;
                 }
+            }.less);
+            std.mem.sortUnstable(HashRefPair, remaining.items, {}, struct {
+                fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
+                    return a.h.compare(b.h) == .lt;
+                }
+            }.less);
+            var i = self.indexHeaders.items.len;
+            while (i > 0) {
+                i -= 1;
+                const header = self.indexHeaders.items[i];
+                try r.seekTo(header.offset);
+                const absent = try self.journalReader.searchManyInIndex(remaining);
+                if (absent == 0) {
+                    break;
+                }
+            }
+            std.mem.sortUnstable(HashRefPair, remaining.items, {}, struct {
+                fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
+                    return a.ref.offset < b.ref.offset;
+                }
+            }.less);
+            i = 0;
+            var j: usize = 0;
+            while (i < journaledRefs.items.len and j < remaining.items.len) {
+                var toFetch: ChunkRef = undefined;
+                if (journaledRefs.items[i].ref.offset <= remaining.items[j].ref.offset) {
+                    toFetch = journaledRefs.items[i].ref;
+                    i += 1;
+                } else {
+                    toFetch = remaining.items[j].ref;
+                    j += 1;
+                }
+                if (!toFetch.isValid()) {
+                    continue;
+                }
+                try r.seekTo(toFetch.offset);
+                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
+                try onFound.invoke(Chunk.moveInit(data));
+            }
+            while (i < journaledRefs.items.len) : (i += 1) {
+                const toFetch = journaledRefs.items[i].ref;
+                if (!toFetch.isValid()) continue;
+                try r.seekTo(toFetch.offset);
+                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
+                try onFound.invoke(Chunk.moveInit(data));
+            }
+            while (j < remaining.items.len) : (j += 1) {
+                const toFetch = remaining.items[j].ref;
+                if (!toFetch.isValid()) continue;
+                try r.seekTo(toFetch.offset);
+                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
+                try onFound.invoke(Chunk.moveInit(data));
             }
         }
 
         pub fn has(self: *Self, key: Hash) !bool {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
-            return self.pending.contains(key) or self.journaledChunks.contains(key);
+            var r = &self.journalReader.reader;
+            if (self.pending.contains(key) or self.journaledChunks.contains(key)) {
+                return true;
+            }
+            var i = self.indexHeaders.items.len;
+            while (i > 0) {
+                i -= 1;
+                const header = self.indexHeaders.items[i];
+                try r.seekTo(header.offset);
+                const maybeRef = try self.journalReader.searchInIndex(key);
+                if (maybeRef != null) {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u32 {
+        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u64 {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
-            var absentCount: u32 = 0;
             var iter = keys.keyIterator();
+            var remaining = std.ArrayList(HashRefPair).empty;
+            defer remaining.deinit(self.alloc);
+            var r = &self.journalReader.reader;
+
             while (iter.next()) |pk| {
                 if (self.pending.contains(pk.*) or self.journaledChunks.contains(pk.*)) {
                     continue;
                 }
-                try onAbsent.invoke(pk.*);
-                absentCount += 1;
+                try remaining.append(self.alloc, .{
+                    .h = pk.*,
+                    .ref = ChunkRef{
+                        .offset = 0,
+                        .size = 0,
+                    },
+                });
             }
-            return absentCount;
+            std.mem.sortUnstable(HashRefPair, remaining.items, {}, struct {
+                fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
+                    return a.h.compare(b.h) == .lt;
+                }
+            }.less);
+            var i = self.indexHeaders.items.len;
+            var absent: u64 = @intCast(remaining.items.len);
+            while (i > 0) {
+                i -= 1;
+                const header = self.indexHeaders.items[i];
+                try r.seekTo(header.offset);
+                // absent can only be smaller or equal for each call to searchManyInIndex
+                absent = try self.journalReader.searchManyInIndex(remaining);
+                if (absent == 0) {
+                    return 0;
+                }
+            }
+            for (remaining.items) |item| {
+                if (!item.ref.isValid()) {
+                    try onAbsent.invoke(item.h);
+                }
+            }
+
+            return absent;
         }
 
         pub fn putMove(self: *Self, chunk: Chunk) !void {
@@ -514,10 +646,6 @@ const IndexHeader = struct {
 const Index = struct {
     const Prefix = u64;
     const Suffix = [12]u8;
-    const HashRefPair = struct {
-        h: Hash,
-        r: ChunkRef,
-    };
     count: u64,
     level: u32,
     next: u64,
@@ -535,7 +663,7 @@ const Index = struct {
         while (it.next()) |e| {
             pairs[i] = .{
                 .h = e.key_ptr.*,
-                .r = e.value_ptr.*,
+                .ref = e.value_ptr.*,
             };
             i += 1;
         }
@@ -556,7 +684,7 @@ const Index = struct {
         while (i < pairs.len) : (i += 1) {
             prefixs[i] = pairs[i].h.prefix();
             suffixs[i] = pairs[i].h.suffix();
-            refs[i] = pairs[i].r;
+            refs[i] = pairs[i].ref;
         }
         return Index{
             .count = count,
@@ -786,6 +914,11 @@ fn JournalWriter(comptime io: std.Io) type {
     };
 }
 
+const HashRefPair = struct {
+    h: Hash,
+    ref: ChunkRef,
+};
+
 fn JournalReader(comptime io: std.Io) type {
     return struct {
         const Self = @This();
@@ -878,6 +1011,160 @@ fn JournalReader(comptime io: std.Io) type {
                 .level = level,
                 .next = next,
             };
+        }
+
+        fn searchInIndex(self: *Self, h: Hash) !?ChunkRef {
+            var r = &self.reader.interface;
+            const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
+            if (recordType != .Index) {
+                return error.SearchIndexTypeMismatch;
+            }
+            const count = try r.takeInt(u64, .big);
+            try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
+            // now at start of prefix
+            const beginOfPrefix = self.reader.logicalPos();
+            const beginOfSuffix = beginOfPrefix + @sizeOf(Index.Prefix) * count;
+            const beginOfRefs = beginOfSuffix + @sizeOf(Index.Suffix) * count;
+
+            const candidate = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, 0, count);
+            if (!candidate.eql) {
+                return null; // prefix not found
+            }
+            try self.reader.seekTo(beginOfSuffix + @sizeOf(Index.Suffix) * candidate.res);
+            var suffix: Index.Suffix = undefined;
+            try r.readSliceAll(&suffix);
+            if (!h.suffixEqual(suffix)) {
+                return null;
+            }
+            try self.reader.seekTo(beginOfRefs + @sizeOf(ChunkRef) * candidate.res);
+            const offset = try r.takeInt(u64, .big);
+            const size = try r.takeInt(u32, .big);
+            return ChunkRef{
+                .offset = offset,
+                .size = size,
+            };
+        }
+
+        // return number of hashes that are still not found in the sortedUniqueHashes
+        fn searchManyInIndex(self: *Self, sortedUniqueHashes: std.ArrayList(HashRefPair)) !u64 {
+            const IndicesPair = struct { i_index: u64, i_input: u64 };
+            var r = &self.reader.interface;
+            const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
+            if (recordType != .Index) {
+                return error.SearchIndexTypeMismatch;
+            }
+            const count = try r.takeInt(u64, .big);
+            try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
+            // now at start of prefix
+            const beginOfPrefix = self.reader.logicalPos();
+            const beginOfSuffix = beginOfPrefix + @sizeOf(Index.Prefix) * count;
+            const beginOfRefs = beginOfSuffix + @sizeOf(Index.Suffix) * count;
+
+            var idxAtValidPrefixes = std.ArrayList(IndicesPair).empty;
+            defer idxAtValidPrefixes.deinit(self.alloc);
+            var i: u64 = 0;
+            var i_input: u64 = 0;
+            var absent: u64 = 0;
+            while (i_input < sortedUniqueHashes.items.len) : (i_input += 1) {
+                if (sortedUniqueHashes.items[i_input].ref.isValid()) {
+                    // already found from other index, skip
+                    continue;
+                }
+                const h = sortedUniqueHashes.items[i_input].h;
+                const up = try looseUpperBound(&self.reader, h.prefix(), beginOfPrefix, i, count);
+                const low = i + (up - i) / 2;
+                const candidate = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, low, up);
+                if (candidate.res != up) {
+                    if (candidate.eql) {
+                        try idxAtValidPrefixes.append(self.alloc, .{
+                            .i_index = candidate.res,
+                            .i_input = i_input,
+                        });
+                        i = candidate.res + 1; // +1 is ok because input hashes are unique
+                    } else {
+                        // so candidate.res points to some elements greater than h.prefix()
+                        absent += 1;
+                        i = low; // low will be the safe lower bound for the next hash (> the current hash)
+                    }
+                } else {
+                    // h.prefix() is already larger than all hashes in the index, can break early
+                    // but make sure to count the absent number correctly
+                    while (i_input < sortedUniqueHashes.items.len) : (i_input += 1) {
+                        if (!sortedUniqueHashes.items[i_input].ref.isValid()) {
+                            absent += 1;
+                        }
+                    }
+                    break;
+                }
+            }
+            // verify idxAtValidPrefixes in suffix
+            var idxAtValidSuffixes = try std.ArrayList(IndicesPair).initCapacity(self.alloc, idxAtValidPrefixes.items.len);
+            defer idxAtValidSuffixes.deinit(self.alloc);
+            for (idxAtValidPrefixes.items) |ci| {
+                var suffixBuf: Index.Suffix = undefined;
+                try self.reader.seekTo(beginOfSuffix + @sizeOf(Index.Suffix) * ci.i_index);
+                try self.reader.interface.readSliceAll(&suffixBuf);
+                if (sortedUniqueHashes.items[ci.i_input].h.suffixEqual(suffixBuf)) {
+                    try idxAtValidSuffixes.append(self.alloc, ci);
+                } else {
+                    absent += 1; // suffix not match, not found
+                }
+            }
+            for (idxAtValidSuffixes.items) |ci| {
+                try self.reader.seekTo(beginOfRefs + @sizeOf(ChunkRef) * ci.i_index);
+                const offset = try r.takeInt(u64, .big);
+                const size = try r.takeInt(u32, .big);
+                sortedUniqueHashes.items[ci.i_input].ref = ChunkRef{
+                    .offset = offset,
+                    .size = size,
+                };
+            }
+            return absent;
+        }
+
+        // return some index whose element is greater than v
+        // if there is multiple valid results, it can return any of them,
+        // and guarentee item[(result+beginIndex)/2] <= v;
+        // if not exist, return end
+        // do this in log(k-begin)
+        fn looseUpperBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !u64 {
+            var i = beginIndex;
+            var step: u64 = 1;
+            while (i < endIndex) {
+                try r.seekTo(beginOffset + i * @sizeOf(u64));
+                const cur = try r.interface.peekInt(u64, .big);
+                if (cur > v) {
+                    return i;
+                }
+                i += step;
+                step *= 2;
+            }
+            return endIndex;
+        }
+
+        // return the first index whose value >= v, if not exist return end
+        fn lowerBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !struct {
+            res: u64,
+            eql: bool,
+        } {
+            var i = beginIndex;
+            var j = endIndex;
+            while (j > i) {
+                const step = (j - i) / 2;
+                try r.seekTo(beginOffset + (i + step) * @sizeOf(u64));
+                const cur = try r.interface.takeInt(u64, .big);
+                if (cur < v) {
+                    i = i + step + 1;
+                } else {
+                    j = i + step;
+                }
+            }
+            if (i == endIndex) {
+                return .{ .res = i, .eql = false };
+            }
+            try r.seekTo(beginOffset + i * @sizeOf(u64));
+            const u = try r.interface.takeInt(u64, .big);
+            return .{ .res = i, .eql = u == v };
         }
     };
 }
@@ -1167,7 +1454,7 @@ test "test index init" {
     try testing.expectEqual(0x1, idx.suffixs[2][11]);
 }
 
-test "index read and write" {
+test "index read/write" {
     const alloc = testing.allocator;
     const io = testing.io;
     var refs = std.AutoHashMap(Hash, ChunkRef).init(alloc);
@@ -1206,6 +1493,8 @@ test "index read and write" {
     try testing.expectEqual(3, idxHeader.count);
     try testing.expectEqual(0, idxHeader.level);
     try testing.expectEqual(0, idxHeader.next);
+
+    try r2.reader.seekTo(0);
 }
 
 // todo: add test that will trigger auto pending flush and index write.
