@@ -287,6 +287,7 @@ pub fn JournalStore(comptime io: std.Io) type {
         journal: File,
         journalReader: JournalReader(io),
         journalWriter: JournalWriter(io),
+        config: Config,
 
         rootHash: Hash,
         pendingSize: u64,
@@ -295,12 +296,14 @@ pub fn JournalStore(comptime io: std.Io) type {
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
         const Self = @This();
-        const MaxJournaledChunksCount = 1000;
-        const MaxPendingSizeInByte = 1 << 20; // 1mb
-        const MaxPendingChunks = 250; // ~ 1mb
-        const IndexBranchingFactor = 10; // 10 level-N index will be merged into a level-N+1 index
+        const Config = struct {
+            MaxJournaledChunksCount: u32 = 1000,
+            MaxPendingSizeInByte: u64 = 1 << 20, // 1mb
+            MaxPendingChunks: u32 = 250, // ~1mb
+            IndexBranchingFactor: u32 = 10, // 10 level-N index will be merged into a level-N+1 index
+        };
 
-        pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
+        pub fn init(alloc: std.mem.Allocator, journalPath: []const u8, config: Config) !Self {
             const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
             var writer = try JournalWriter(io).init(alloc, journal);
             errdefer writer.deinit();
@@ -317,6 +320,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .rootHash = Hash.Empty,
                 .mu = std.Io.RwLock.init,
                 .alloc = alloc,
+                .config = config,
                 .journal = journal,
                 .journalReader = reader,
                 .journalWriter = writer,
@@ -533,7 +537,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             }
             try self.pending.put(chunk.h, chunk);
             self.pendingSize += chunk.data.len;
-            if (self.pendingSize >= Self.MaxPendingSizeInByte or self.pending.count() >= Self.MaxPendingChunks) {
+            if (self.pendingSize >= self.config.MaxPendingSizeInByte or self.pending.count() >= self.config.MaxPendingChunks) {
                 try self.writePending();
             }
         }
@@ -602,12 +606,12 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .store = self,
             };
 
-            try self.journalWriter.writeChunks(self.pending, &cb);
+            try self.journalWriter.writeChunksNoFlush(self.pending, &cb);
             try self.journalWriter.writer.flush();
             self.clearPending();
 
             // write index
-            if (self.journaledChunks.count() >= Self.MaxJournaledChunksCount) {
+            if (self.journaledChunks.count() >= self.config.MaxJournaledChunksCount) {
                 const idx = try Index.init(self.alloc, self.journaledChunks);
                 defer idx.deinit();
                 const idxOffset = self.journalWriter.writer.logicalPos();
@@ -623,7 +627,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             }
 
             // merge index
-            var count = mergableIndices(self.indexHeaders);
+            var count = mergableIndices(self.indexHeaders, self.config.IndexBranchingFactor);
             while (count > 0) {
                 const end = self.indexHeaders.items.len;
                 const begin = end - count;
@@ -631,7 +635,9 @@ pub fn JournalStore(comptime io: std.Io) type {
                 const toMerge = self.indexHeaders.items[begin..end];
                 const level = toMerge[0].level;
                 if (level > Index.MaxMergableLevelInMemory) {
-                    std.debug.panic("merging of level {d} index: not implemented!\n", .{level});
+                    // TODO: should do an on-disk index merge, but leave that work to future for now.
+                    // currently, just do not continue to merge, so number of index at MaxMergableLevelInMemory will grow linearly from here.
+                    break;
                 }
                 // in memory merging
                 const indices = try self.alloc.alloc(Index, count);
@@ -661,14 +667,14 @@ pub fn JournalStore(comptime io: std.Io) type {
                 };
                 // update the prev's header's next field to point to the merged index
                 self.indexHeaders.items[begin - 1].next = startOfMerged;
-                try self.journalWriter.updateIndexNext(self.indexHeaders.items[begin - 1]);
+                try self.journalWriter.updateIndexHeader(self.indexHeaders.items[begin - 1], &self.journalReader.reader);
                 try self.journalWriter.writeIndex(merged);
 
-                count = mergableIndices(self.indexHeaders);
+                count = mergableIndices(self.indexHeaders, self.config.IndexBranchingFactor);
             }
         }
 
-        fn mergableIndices(indexHeaders: std.ArrayList(IndexHeader)) u64 {
+        fn mergableIndices(indexHeaders: std.ArrayList(IndexHeader), factor: u32) u64 {
             std.debug.assert(indexHeaders.items.len > 0);
 
             const minLevel = indexHeaders.items[indexHeaders.items.len - 1].level;
@@ -682,7 +688,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                     break;
                 }
             }
-            if (count >= IndexBranchingFactor) {
+            if (count >= factor) {
                 return count;
             }
             return 0;
@@ -691,7 +697,9 @@ pub fn JournalStore(comptime io: std.Io) type {
         fn mergeIndexInMemory(alloc: std.mem.Allocator, indices: []Index) !Index {
             var pairs = std.ArrayList(HashRefPair).empty;
             defer pairs.deinit(alloc);
+            var maxLevel: u32 = 0;
             for (indices) |*idx| {
+                maxLevel = @max(maxLevel, idx.level);
                 var iter = idx.iterator();
                 while (iter.next()) |item| {
                     try pairs.append(alloc, item);
@@ -702,7 +710,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                     return a.h.compare(b.h) == .lt;
                 }
             }.less);
-            return Index.initFromSorted(alloc, pairs.items);
+            return Index.initFromSorted(alloc, pairs.items, maxLevel + 1);
         }
 
         fn clearPending(self: *Self) void {
@@ -725,7 +733,7 @@ pub fn JournalStore(comptime io: std.Io) type {
 
             try self.writePending();
 
-            try self.journalWriter.writeRoot(current);
+            try self.journalWriter.writeRootNoFlush(current);
             try self.journalWriter.writer.flush();
             self.rootHash = current;
 
@@ -784,10 +792,10 @@ const Index = struct {
                 return lhs.h.compare(rhs.h) == .lt;
             }
         }.less);
-        return Index.initFromSorted(alloc, pairs);
+        return Index.initFromSorted(alloc, pairs, 0);
     }
 
-    pub fn initFromSorted(alloc: std.mem.Allocator, sorted: []HashRefPair) !Index {
+    pub fn initFromSorted(alloc: std.mem.Allocator, sorted: []HashRefPair, level: u32) !Index {
         const count = sorted.len;
         var prefixs = try alloc.alloc(u64, count);
         errdefer alloc.free(prefixs);
@@ -803,7 +811,7 @@ const Index = struct {
         }
         return Index{
             .count = count,
-            .level = 0,
+            .level = level,
             .next = 0,
             .prefixs = prefixs,
             .suffixs = suffixs,
@@ -861,7 +869,14 @@ const Index = struct {
         const level = try r.takeInt(u32);
         // next
         const next = try r.takeInt(u64);
+        // header_crc
+        const header_crc = hasher.final();
+        const read_header_crc = try reader.takeInt(u32, .big);
+        if (header_crc != read_header_crc) {
+            return error.HeaderCrc32NotMatch;
+        }
 
+        hasher = .init();
         var prefixs = try alloc.alloc(u64, count);
         errdefer alloc.free(prefixs);
         var suffixs = try alloc.alloc(Suffix, count);
@@ -967,7 +982,7 @@ fn JournalWriter(comptime io: std.Io) type {
             self.alloc.free(self.buffer);
         }
 
-        pub fn writeChunks(self: *Self, chunkSets: HashChunkMap, onChunkWritten: anytype) !void {
+        pub fn writeChunksNoFlush(self: *Self, chunkSets: HashChunkMap, onChunkWritten: anytype) !void {
             var w = &self.writer.interface;
 
             // type (1)
@@ -989,10 +1004,59 @@ fn JournalWriter(comptime io: std.Io) type {
             try w.writeAll(&hashAcc.bytes);
         }
 
-        pub fn updateIndexNext(self: *Self, header: IndexHeader) !void {
+        const WriterContext = struct {
+            bw: *std.Io.Writer,
+            hasher: *std.hash.Crc32,
+
+            fn writeAll(ctx: *@This(), bytes: []const u8) !void {
+                try ctx.bw.writeAll(bytes);
+                ctx.hasher.update(bytes);
+            }
+            fn writeByte(ctx: *@This(), byte: u8) !void {
+                try ctx.bw.writeByte(byte);
+                ctx.hasher.update(&[_]u8{byte});
+            }
+            fn writeInt(ctx: *@This(), comptime T: type, n: T) !void {
+                var buf: [@sizeOf(T)]u8 = undefined;
+                std.mem.writeInt(T, &buf, n, .big);
+                try ctx.bw.writeAll(&buf);
+                ctx.hasher.update(&buf);
+            }
+        };
+
+        pub fn updateIndexHeader(self: *Self, header: IndexHeader, r: *std.Io.File.Reader) !void {
+            const base_writer = &self.writer.interface;
             const curPos = self.writer.logicalPos();
-            try self.writer.seekTo(header.offset + 1 + 8 + 4); // move to next
-            try self.writer.interface.writeInt(u64, header.next, .big);
+            try self.writer.seekTo(header.offset);
+            try r.seekTo(header.offset);
+            var hasher = std.hash.Crc32.init();
+            var w = WriterContext{ .bw = base_writer, .hasher = &hasher };
+            const recordType: JournalRecordType = @enumFromInt(try r.interface.takeByte());
+            if (recordType != .Index) {
+                return error.ReadIndexTypeMismatch;
+            }
+            // count
+            const count = try r.interface.takeInt(u64, .big);
+            // level
+            const level = try r.interface.takeInt(u32, .big);
+            if (count != header.count) {
+                return error.CountNotMatch;
+            }
+            if (level != header.level) {
+                return error.LevelNotMatch;
+            }
+            // type (1)
+            try w.writeByte(@intFromEnum(JournalRecordType.Index));
+            // count (8)
+            try w.writeInt(u64, header.count);
+            // level (4)
+            try w.writeInt(u32, header.level);
+            // next (8)
+            try w.writeInt(u64, header.next);
+            // header crc (4)
+            const header_crc32 = hasher.final();
+            try base_writer.writeInt(u32, header_crc32, .big);
+            try self.writer.flush();
             try self.writer.seekTo(curPos);
         }
 
@@ -1008,25 +1072,6 @@ fn JournalWriter(comptime io: std.Io) type {
                 return error.SuffixsLenInvalid;
             }
             var hasher = std.hash.Crc32.init();
-            const WriterContext = struct {
-                bw: *std.Io.Writer,
-                hasher: *std.hash.Crc32,
-
-                fn writeAll(ctx: *@This(), bytes: []const u8) !void {
-                    try ctx.bw.writeAll(bytes);
-                    ctx.hasher.update(bytes);
-                }
-                fn writeByte(ctx: *@This(), byte: u8) !void {
-                    try ctx.bw.writeByte(byte);
-                    ctx.hasher.update(&[_]u8{byte});
-                }
-                fn writeInt(ctx: *@This(), comptime T: type, n: T) !void {
-                    var buf: [@sizeOf(T)]u8 = undefined;
-                    std.mem.writeInt(T, &buf, n, .big);
-                    try ctx.bw.writeAll(&buf);
-                    ctx.hasher.update(&buf);
-                }
-            };
             var w = WriterContext{ .bw = base_writer, .hasher = &hasher };
 
             // type (1)
@@ -1037,6 +1082,10 @@ fn JournalWriter(comptime io: std.Io) type {
             try w.writeInt(u32, index.level);
             // next (8)
             try w.writeInt(u64, index.next);
+            // header crc (4)
+            const header_crc32 = hasher.final();
+            try base_writer.writeInt(u32, header_crc32, .big);
+            hasher = .init();
             // prefix
             for (index.prefixs) |prefix| {
                 try w.writeInt(u64, prefix);
@@ -1053,9 +1102,11 @@ fn JournalWriter(comptime io: std.Io) type {
             // crc32
             const crc32 = hasher.final();
             try base_writer.writeInt(u32, crc32, .big);
+            // write index without a flush almost always results a bug
+            try self.writer.flush();
         }
 
-        pub fn writeRoot(self: *Self, root: Hash) !void {
+        pub fn writeRootNoFlush(self: *Self, root: Hash) !void {
             var w = &self.writer.interface;
             // type (1)
             try w.writeByte(@intFromEnum(JournalRecordType.Root));
@@ -1156,6 +1207,7 @@ fn JournalReader(comptime io: std.Io) type {
             const count = try r.takeInt(u64, .big);
             const level = try r.takeInt(u32, .big);
             const next = try r.takeInt(u64, .big);
+            _ = try r.takeInt(u32, .big);
             const toSkip = count * (Index.PrefixSize + Index.SuffixSize + ChunkRef.DiskSize) + @sizeOf(u32);
 
             try self.reader.seekBy(@intCast(toSkip));
@@ -1174,7 +1226,7 @@ fn JournalReader(comptime io: std.Io) type {
                 return error.SearchIndexTypeMismatch;
             }
             const count = try r.takeInt(u64, .big);
-            try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
+            try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32) + @sizeOf(u32));
             // now at start of prefix
             const beginOfPrefix = self.reader.logicalPos();
             const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
@@ -1212,7 +1264,7 @@ fn JournalReader(comptime io: std.Io) type {
                 return error.SearchIndexTypeMismatch;
             }
             const count = try r.takeInt(u64, .big);
-            try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
+            try self.reader.seekBy(@sizeOf(u64) + 2 * @sizeOf(u32));
             // now at start of prefix
             const beginOfPrefix = self.reader.logicalPos();
             const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
@@ -1494,7 +1546,7 @@ test "test journal chunk store" {
     const alloc = testing.allocator;
     Dir.cwd().deleteTree(io, "tmp/testJournalStore") catch {};
     const tmpJournalPath = "tmp/testJournalStore/test.zjs";
-    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    var store = try JournalStore(io).init(alloc, tmpJournalPath, .{});
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStore") catch {};
     defer store.deinit();
 
@@ -1529,8 +1581,8 @@ test "test journal writer and reader" {
         fn invoke(_: *@This(), _: Hash, _: u64, _: u64) !void {}
     };
     var cb = NoopCB{};
-    try w.writeChunks(chunkSet, &cb);
-    try w.writeRoot(Hash.of("a"));
+    try w.writeChunksNoFlush(chunkSet, &cb);
+    try w.writeRootNoFlush(Hash.of("a"));
     try w.writer.flush();
 
     var r = try JournalReader(io).init(alloc, journal);
@@ -1560,7 +1612,7 @@ test "test journal store" {
     const alloc = testing.allocator;
     Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     const tmpJournalPath = "tmp/testJournalStore2/test.zjs";
-    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    var store = try JournalStore(io).init(alloc, tmpJournalPath, .{});
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     defer store.deinit();
 
@@ -1582,7 +1634,7 @@ test "test journal store" {
     try testing.expect(try store.commit(Hash.of("a"), try store.root()));
 
     // test rebase
-    var store2 = try JournalStore(io).init(alloc, tmpJournalPath);
+    var store2 = try JournalStore(io).init(alloc, tmpJournalPath, .{});
     defer store2.deinit();
     try store2.rebase();
 }
@@ -1846,7 +1898,10 @@ test "test everything in JournalStore" {
 
     Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
     const tmpJournalPath = "tmp/testJournalStoreAll/test.zjs";
-    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    var store = try JournalStore(io).init(alloc, tmpJournalPath, .{
+        .MaxPendingChunks = 25,
+        .MaxJournaledChunksCount = 100,
+    });
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
     defer store.deinit();
 
@@ -1868,7 +1923,10 @@ test "test everything in JournalStore" {
     const tWrite = std.Io.Timestamp.now(io, .real);
     std.debug.print("[perf] build: {d}ms\n", .{tStart.durationTo(tWrite).toMilliseconds()});
 
-    // try testing.expectEqual(1 + totalChunks / JournalStore(io).MaxJournaledChunksCount, store.indexHeaders.items.len);
+    for (store.indexHeaders.items) |header| {
+        std.debug.print("[debug] level={d}, count={d}\n", .{ header.level, header.count });
+    }
+    try testing.expectEqual(1 + 2 + 3 + 6, store.indexHeaders.items.len); // 2 level-2, 3 level-1, 6 level-0
     // try testing.expectEqual(500, store.journaledChunks.count());
     // try testing.expectEqual(166, store.pending.count());
 
