@@ -1694,6 +1694,7 @@ test "index read/write" {
 test "test everything in JournalStore" {
     const alloc = testing.allocator;
     const io = testing.io;
+    const tStart = std.Io.Timestamp.now(io, .real);
     var cs = std.AutoHashMap(Hash, Chunk).init(alloc);
     defer {
         var iter = cs.valueIterator();
@@ -1724,6 +1725,9 @@ test "test everything in JournalStore" {
         try store.putMove(Chunk.moveInit(data));
     }
 
+    const tWrite = std.Io.Timestamp.now(io, .real);
+    std.debug.print("[perf] build: {d}ms\n", .{tStart.durationTo(tWrite).toMilliseconds()});
+
     try testing.expectEqual(1 + totalChunks / JournalStore(io).MaxJournaledChunksCount, store.indexHeaders.items.len);
     try testing.expectEqual(500, store.journaledChunks.count());
     try testing.expectEqual(166, store.pending.count());
@@ -1731,25 +1735,35 @@ test "test everything in JournalStore" {
     const NotExist = Hash.of("not exist");
     const AlsoNotExist = Hash.of("also not exist");
     // has
-    var iter = cs.iterator();
-    while (iter.next()) |e| {
-        try testing.expect(try store.has(e.key_ptr.*));
+    {
+        const tHasStart = std.Io.Timestamp.now(io, .real);
+        var iter = cs.iterator();
+        while (iter.next()) |e| {
+            try testing.expect(try store.has(e.key_ptr.*));
+        }
+        try testing.expect(!try store.has(NotExist));
+        const tHasEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] has: {d}ms\n", .{tHasStart.durationTo(tHasEnd).toMilliseconds()});
     }
-    try testing.expect(!try store.has(NotExist));
 
     // get
-    iter = cs.iterator();
-    while (iter.next()) |e| {
-        const chunk = try store.get(e.key_ptr.*);
-        try testing.expect(chunk != null);
-        defer chunk.?.deinit(alloc);
-        try testing.expectEqualSlices(u8, e.value_ptr.*.data, chunk.?.data);
+    {
+        const tGetStart = std.Io.Timestamp.now(io, .real);
+        var iter = cs.iterator();
+        while (iter.next()) |e| {
+            const chunk = try store.get(e.key_ptr.*);
+            try testing.expect(chunk != null);
+            defer chunk.?.deinit(alloc);
+            try testing.expectEqualSlices(u8, e.value_ptr.*.data, chunk.?.data);
+        }
+        const tGetEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] get: {d}ms\n", .{tGetStart.durationTo(tGetEnd).toMilliseconds()});
     }
 
     // hasMany
     var checkSet = HashSet.init(alloc);
     defer checkSet.deinit();
-    iter = cs.iterator();
+    var iter = cs.iterator();
     var count: usize = 0;
     while (iter.next()) |e| {
         if (count >= 100) break;
@@ -1759,26 +1773,32 @@ test "test everything in JournalStore" {
     try checkSet.put(NotExist, {});
     try checkSet.put(AlsoNotExist, {});
 
-    var absentInvoked: u32 = 0;
-    var absentHashes = HashSet.init(alloc);
-    defer absentHashes.deinit();
-    var onAbsent = struct {
-        pCount: *u32,
-        pHashes: *HashSet,
-        fn invoke(self: *@This(), h: Hash) !void {
-            self.pCount.* += 1;
-            try self.pHashes.put(h, {});
-        }
-    }{ .pCount = &absentInvoked, .pHashes = &absentHashes };
+    {
+        const tHasManyStart = std.Io.Timestamp.now(io, .real);
+        var absentInvoked: u32 = 0;
+        var absentHashes = HashSet.init(alloc);
+        defer absentHashes.deinit();
+        var onAbsent = struct {
+            pCount: *u32,
+            pHashes: *HashSet,
+            fn invoke(self: *@This(), h: Hash) !void {
+                self.pCount.* += 1;
+                try self.pHashes.put(h, {});
+            }
+        }{ .pCount = &absentInvoked, .pHashes = &absentHashes };
 
-    const absentCount = try store.hasMany(&checkSet, &onAbsent);
-    try testing.expectEqual(2, absentCount);
-    try testing.expectEqual(2, absentInvoked);
-    try testing.expect(absentHashes.contains(NotExist));
-    try testing.expect(absentHashes.contains(AlsoNotExist));
+        const absentCount = try store.hasMany(&checkSet, &onAbsent);
+        try testing.expectEqual(2, absentCount);
+        try testing.expectEqual(2, absentInvoked);
+        try testing.expect(absentHashes.contains(NotExist));
+        try testing.expect(absentHashes.contains(AlsoNotExist));
+        const tHasManyEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] hasMany: {d}ms\n", .{tHasManyStart.durationTo(tHasManyEnd).toMilliseconds()});
+    }
 
     // getMany
     {
+        const tGetManyStart = std.Io.Timestamp.now(io, .real);
         var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
         defer {
             var fit = foundChunks.valueIterator();
@@ -1795,6 +1815,9 @@ test "test everything in JournalStore" {
         }{ .pFound = &foundChunks };
 
         try store.getMany(&checkSet, &onFound);
+
+        const tGetManyEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] getMany: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});
 
         // should find all 100 existing chunks, not the 2 non-existing ones
         try testing.expectEqual(100, foundChunks.count());
@@ -1831,7 +1854,12 @@ test "test everything in JournalStore" {
             }
         }{ .pFound = &foundChunks };
 
+        const tGetManyStart = std.Io.Timestamp.now(io, .real);
+
         try store.getMany(&allHashes, &onFound);
+
+        const tGetManyEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] getMany all: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});
 
         // should find all chunks in cs
         try testing.expectEqual(cs.count(), foundChunks.count());
@@ -1850,7 +1878,7 @@ test "test everything in JournalStore" {
         var emptySet = HashSet.init(alloc);
         defer emptySet.deinit();
         try emptySet.put(NotExist, {});
-        try emptySet.put(Hash.of("also not exist"), {});
+        try emptySet.put(AlsoNotExist, {});
 
         var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
         defer foundChunks.deinit();
@@ -1895,3 +1923,8 @@ test "test everything in JournalStore" {
         try testing.expectEqual(50, foundChunks.count());
     }
 }
+
+// todo
+// index merge
+// block cache
+// bloom filter
