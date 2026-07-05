@@ -1710,7 +1710,7 @@ test "test everything in JournalStore" {
     defer store.deinit();
 
     var i: u64 = 0;
-    const totalChunks = 10666;
+    const totalChunks = 3666;
     while (i < totalChunks) : (i += 1) {
         var data: []u8 = undefined;
         if (i % 3 == 0) {
@@ -1725,8 +1725,8 @@ test "test everything in JournalStore" {
     }
 
     try testing.expectEqual(1 + totalChunks / JournalStore(io).MaxJournaledChunksCount, store.indexHeaders.items.len);
-    // try testing.expectEqual(500, store.journaledChunks.count());
-    // try testing.expectEqual(166, store.pending.count());
+    try testing.expectEqual(500, store.journaledChunks.count());
+    try testing.expectEqual(166, store.pending.count());
 
     const NotExist = Hash.of("not exist");
     const AlsoNotExist = Hash.of("also not exist");
