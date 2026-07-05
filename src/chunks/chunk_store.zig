@@ -268,6 +268,8 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
 }
 
 const ChunkRef = struct {
+    const DiskSize = @sizeOf(u64) + @sizeOf(u32);
+    const empty = ChunkRef{ .offset = 0, .size = 0 };
     offset: u64,
     size: u32,
 
@@ -293,8 +295,9 @@ pub fn JournalStore(comptime io: std.Io) type {
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
         const Self = @This();
-        const MaxJournaledChunksCount = 1000;
+        const MaxJournaledChunksCount = 100; // should be 1000
         const MaxPendingSizeInByte = 1 << 20; // 1mb
+        const MaxPendingChunks = 25; // ~ 1mb should be 250
 
         pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
             const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
@@ -404,11 +407,13 @@ pub fn JournalStore(comptime io: std.Io) type {
                 }
             }.less);
             var i = self.indexHeaders.items.len;
+            var absent = remaining.items.len;
             while (i > 0) {
                 i -= 1;
                 const header = self.indexHeaders.items[i];
                 try r.seekTo(header.offset);
-                const absent = try self.journalReader.searchManyInIndex(remaining);
+                const found = try self.journalReader.searchManyInIndex(remaining);
+                absent -= found;
                 if (absent == 0) {
                     break;
                 }
@@ -499,16 +504,21 @@ pub fn JournalStore(comptime io: std.Io) type {
             }.less);
             var i = self.indexHeaders.items.len;
             var absent: u64 = @intCast(remaining.items.len);
+            std.debug.print("[debug] remaining.items.len = {d}, indexHeaders.len = {d}\n", .{ remaining.items.len, self.indexHeaders.items.len });
             while (i > 0) {
                 i -= 1;
                 const header = self.indexHeaders.items[i];
                 try r.seekTo(header.offset);
-                // absent can only be smaller or equal for each call to searchManyInIndex
-                absent = try self.journalReader.searchManyInIndex(remaining);
+                std.debug.print("[debug] searching index {d}, offset={d}, count={d}\n", .{ i, header.offset, header.count });
+                const found = try self.journalReader.searchManyInIndex(remaining);
+                std.debug.print("[debug] found={d}, absent={d}\n", .{ found, absent - found });
+                absent -= found;
+                std.debug.print("[debug] absent = {d}\n", .{absent});
                 if (absent == 0) {
                     return 0;
                 }
             }
+            std.debug.print("[debug] ----- \n", .{});
             for (remaining.items) |item| {
                 if (!item.ref.isValid()) {
                     try onAbsent.invoke(item.h);
@@ -526,7 +536,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             }
             try self.pending.put(chunk.h, chunk);
             self.pendingSize += chunk.data.len;
-            if (self.pendingSize > Self.MaxPendingSizeInByte) {
+            if (self.pendingSize >= Self.MaxPendingSizeInByte or self.pending.count() >= Self.MaxPendingChunks) {
                 try self.writePending();
             }
         }
@@ -594,6 +604,20 @@ pub fn JournalStore(comptime io: std.Io) type {
             try self.journalWriter.writeChunks(self.pending, &cb);
             try self.journalWriter.writer.flush();
             self.clearPending();
+
+            if (self.journaledChunks.count() >= Self.MaxJournaledChunksCount) {
+                const idx = try Index.init(self.alloc, self.journaledChunks);
+                defer idx.deinit();
+                const idxOffset = self.journalWriter.writer.logicalPos();
+                try self.journalWriter.writeIndex(idx);
+                try self.indexHeaders.append(self.alloc, .{
+                    .offset = idxOffset,
+                    .count = idx.count,
+                    .level = idx.level,
+                    .next = idx.next,
+                });
+                self.journaledChunks.clearAndFree();
+            }
         }
 
         fn clearPending(self: *Self) void {
@@ -615,18 +639,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             }
 
             try self.writePending();
-            if (self.journaledChunks.count() > Self.MaxJournaledChunksCount) {
-                const idx = try Index.init(self.alloc, self.journaledChunks);
-                const idxOffset = self.journalWriter.writer.logicalPos();
-                try self.journalWriter.writeIndex(idx);
-                try self.indexHeaders.append(self.alloc, .{
-                    .offset = idxOffset,
-                    .count = idx.count,
-                    .level = idx.level,
-                    .next = idx.next,
-                });
-                self.journaledChunks.clearAndFree();
-            }
+
             try self.journalWriter.writeRoot(current);
             try self.journalWriter.writer.flush();
             self.rootHash = current;
@@ -643,9 +656,16 @@ const IndexHeader = struct {
     next: u64,
 };
 
+// level-0 holds 1,000 chunks ~ 4MB
+// level-1 holds 10,000 chunks (10 level-0 index) ~40MB
+// level-2 holds 100,000 chunks ~400MB
+// level-3 holds 1,000,000 chunks ~4GB
+// and so on
 const Index = struct {
     const Prefix = u64;
+    const PrefixSize = @sizeOf(u64);
     const Suffix = [12]u8;
+    const SuffixSize = 12 * @sizeOf(u8);
     count: u64,
     level: u32,
     next: u64,
@@ -654,6 +674,7 @@ const Index = struct {
     refs: []ChunkRef,
     alloc: std.mem.Allocator,
 
+    // init an level-0 index from chunk refs
     pub fn init(alloc: std.mem.Allocator, chunkRefs: std.AutoHashMap(Hash, ChunkRef)) !Index {
         const count = chunkRefs.count();
         var pairs = try alloc.alloc(HashRefPair, count);
@@ -959,8 +980,7 @@ fn JournalReader(comptime io: std.Io) type {
             const chunkCount = try r.takeInt(u32, .big);
             var hashAcc = Hash.ofNumber(u32, chunkCount);
 
-            var i: u32 = 0;
-            while (i < chunkCount) : (i += 1) {
+            for (0..chunkCount) |_| {
                 //hash
                 const h = try Hash.fromReader(r);
                 hashAcc = hashAcc.add(h);
@@ -1002,7 +1022,7 @@ fn JournalReader(comptime io: std.Io) type {
             const count = try r.takeInt(u64, .big);
             const level = try r.takeInt(u32, .big);
             const next = try r.takeInt(u64, .big);
-            const toSkip = count * (@sizeOf(Index.Prefix) + @sizeOf(Index.Suffix) + @sizeOf(ChunkRef)) + @sizeOf(u32);
+            const toSkip = count * (Index.PrefixSize + Index.SuffixSize + ChunkRef.DiskSize) + @sizeOf(u32);
 
             try self.reader.seekBy(@intCast(toSkip));
             return .{
@@ -1023,31 +1043,35 @@ fn JournalReader(comptime io: std.Io) type {
             try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
             // now at start of prefix
             const beginOfPrefix = self.reader.logicalPos();
-            const beginOfSuffix = beginOfPrefix + @sizeOf(Index.Prefix) * count;
-            const beginOfRefs = beginOfSuffix + @sizeOf(Index.Suffix) * count;
+            const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
+            const beginOfRefs = beginOfSuffix + Index.SuffixSize * count;
 
-            const candidate = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, 0, count);
-            if (!candidate.eql) {
+            const res = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, 0, count);
+            if (res == count) {
                 return null; // prefix not found
             }
-            try self.reader.seekTo(beginOfSuffix + @sizeOf(Index.Suffix) * candidate.res);
+            const eqlCount = try countEql(&self.reader, h.prefix(), beginOfPrefix, res, count);
+            try self.reader.seekTo(beginOfSuffix + Index.SuffixSize * res);
             var suffix: Index.Suffix = undefined;
-            try r.readSliceAll(&suffix);
-            if (!h.suffixEqual(suffix)) {
-                return null;
+            for (0..eqlCount) |_| {
+                try r.readSliceAll(&suffix);
+                if (h.suffixEqual(suffix)) {
+                    try self.reader.seekTo(beginOfRefs + ChunkRef.DiskSize * res);
+                    const offset = try r.takeInt(u64, .big);
+                    const size = try r.takeInt(u32, .big);
+                    return ChunkRef{
+                        .offset = offset,
+                        .size = size,
+                    };
+                }
             }
-            try self.reader.seekTo(beginOfRefs + @sizeOf(ChunkRef) * candidate.res);
-            const offset = try r.takeInt(u64, .big);
-            const size = try r.takeInt(u32, .big);
-            return ChunkRef{
-                .offset = offset,
-                .size = size,
-            };
+            return null;
         }
 
-        // return number of hashes that are still not found in the sortedUniqueHashes
+        // return number of hashes that are newly found in this index
         fn searchManyInIndex(self: *Self, sortedUniqueHashes: std.ArrayList(HashRefPair)) !u64 {
-            const IndicesPair = struct { i_index: u64, i_input: u64 };
+            const CheckRange = struct { i_index: u64, count: u64, i_input: u64 };
+            const CheckedIndex = struct { i_index: u64, i_input: u64 };
             var r = &self.reader.interface;
             const recordType: JournalRecordType = @enumFromInt(try r.takeByte());
             if (recordType != .Index) {
@@ -1057,61 +1081,68 @@ fn JournalReader(comptime io: std.Io) type {
             try self.reader.seekBy(@sizeOf(u64) + @sizeOf(u32));
             // now at start of prefix
             const beginOfPrefix = self.reader.logicalPos();
-            const beginOfSuffix = beginOfPrefix + @sizeOf(Index.Prefix) * count;
-            const beginOfRefs = beginOfSuffix + @sizeOf(Index.Suffix) * count;
+            const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
+            const beginOfRefs = beginOfSuffix + Index.SuffixSize * count;
 
-            var idxAtValidPrefixes = std.ArrayList(IndicesPair).empty;
-            defer idxAtValidPrefixes.deinit(self.alloc);
+            var suffixRangeToCheck = std.ArrayList(CheckRange).empty;
+            defer suffixRangeToCheck.deinit(self.alloc);
             var i: u64 = 0;
-            var i_input: u64 = 0;
-            var absent: u64 = 0;
-            while (i_input < sortedUniqueHashes.items.len) : (i_input += 1) {
+            for (0..sortedUniqueHashes.items.len) |i_input| {
                 if (sortedUniqueHashes.items[i_input].ref.isValid()) {
                     // already found from other index, skip
                     continue;
                 }
                 const h = sortedUniqueHashes.items[i_input].h;
-                const up = try looseUpperBound(&self.reader, h.prefix(), beginOfPrefix, i, count);
-                const low = i + (up - i) / 2;
-                const candidate = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, low, up);
-                if (candidate.res != up) {
-                    if (candidate.eql) {
-                        try idxAtValidPrefixes.append(self.alloc, .{
-                            .i_index = candidate.res,
-                            .i_input = i_input,
-                        });
-                        i = candidate.res + 1; // +1 is ok because input hashes are unique
-                    } else {
-                        // so candidate.res points to some elements greater than h.prefix()
-                        absent += 1;
-                        i = low; // low will be the safe lower bound for the next hash (> the current hash)
-                    }
-                } else {
-                    // h.prefix() is already larger than all hashes in the index, can break early
-                    // but make sure to count the absent number correctly
-                    while (i_input < sortedUniqueHashes.items.len) : (i_input += 1) {
-                        if (!sortedUniqueHashes.items[i_input].ref.isValid()) {
-                            absent += 1;
-                        }
-                    }
+
+                std.debug.print("[debug] i={d} i_input={d} h={s}\n", .{ i, i_input, h.toString() });
+                const lub = try looseUpperBound(&self.reader, h.prefix(), beginOfPrefix, i, count);
+                std.debug.print("[debug] last{d} up={d}\n", .{ lub.up, lub.last });
+                const res = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, lub.last, lub.up);
+                std.debug.print("[debug] res={d}\n", .{res});
+                if (res == count) {
+                    // there is no index who is >= currrent hash, therefore all hashes after this one can be skiped
                     break;
                 }
+                // res points at the first element >= h.prefix()
+                // try self.reader.seekTo(beginOfPrefix + res * Index.PrefixSize);
+                // const verify = try r.takeInt(u64, .big);
+                // if (h.prefix() == verify) {
+                //     // todo: multiple prefix match in index
+                //     try idxAtValidPrefixes.append(self.alloc, .{
+                //         .i_index = res,
+                //         .i_input = i_input,
+                //     });
+                // }
+                const eqCount = try countEql(&self.reader, h.prefix(), beginOfPrefix, res, count);
+                if (eqCount > 0) {
+                    try suffixRangeToCheck.append(self.alloc, .{
+                        .i_index = res,
+                        .count = eqCount,
+                        .i_input = i_input,
+                    });
+                }
+                i = res; // because res is the first place whose value >= current input hash prefix
             }
+            std.debug.print("-----\n", .{});
             // verify idxAtValidPrefixes in suffix
-            var idxAtValidSuffixes = try std.ArrayList(IndicesPair).initCapacity(self.alloc, idxAtValidPrefixes.items.len);
+            var idxAtValidSuffixes = try std.ArrayList(CheckedIndex).initCapacity(self.alloc, suffixRangeToCheck.items.len);
             defer idxAtValidSuffixes.deinit(self.alloc);
-            for (idxAtValidPrefixes.items) |ci| {
+            for (suffixRangeToCheck.items) |cr| {
                 var suffixBuf: Index.Suffix = undefined;
-                try self.reader.seekTo(beginOfSuffix + @sizeOf(Index.Suffix) * ci.i_index);
-                try self.reader.interface.readSliceAll(&suffixBuf);
-                if (sortedUniqueHashes.items[ci.i_input].h.suffixEqual(suffixBuf)) {
-                    try idxAtValidSuffixes.append(self.alloc, ci);
-                } else {
-                    absent += 1; // suffix not match, not found
+                try self.reader.seekTo(beginOfSuffix + Index.SuffixSize * cr.i_index);
+                for (0..cr.count) |_| {
+                    try self.reader.interface.readSliceAll(&suffixBuf);
+                    if (sortedUniqueHashes.items[cr.i_input].h.suffixEqual(suffixBuf)) {
+                        try idxAtValidSuffixes.append(self.alloc, .{
+                            .i_index = cr.i_index,
+                            .i_input = cr.i_input,
+                        });
+                        break;
+                    }
                 }
             }
             for (idxAtValidSuffixes.items) |ci| {
-                try self.reader.seekTo(beginOfRefs + @sizeOf(ChunkRef) * ci.i_index);
+                try self.reader.seekTo(beginOfRefs + ChunkRef.DiskSize * ci.i_index);
                 const offset = try r.takeInt(u64, .big);
                 const size = try r.takeInt(u32, .big);
                 sortedUniqueHashes.items[ci.i_input].ref = ChunkRef{
@@ -1119,34 +1150,35 @@ fn JournalReader(comptime io: std.Io) type {
                     .size = size,
                 };
             }
-            return absent;
+            return idxAtValidSuffixes.items.len;
         }
 
-        // return some index whose element is greater than v
+        // return some index whose element >= v
         // if there is multiple valid results, it can return any of them,
-        // and guarentee item[(result+beginIndex)/2] <= v;
-        // if not exist, return end
+        // if not exist, return end and last (if not equal to end, then it is guarenteed that items[last] < v)
         // do this in log(k-begin)
-        fn looseUpperBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !u64 {
+        fn looseUpperBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !struct {
+            up: u64,
+            last: u64,
+        } {
             var i = beginIndex;
             var step: u64 = 1;
+            var last = i;
             while (i < endIndex) {
                 try r.seekTo(beginOffset + i * @sizeOf(u64));
-                const cur = try r.interface.peekInt(u64, .big);
-                if (cur > v) {
-                    return i;
+                const cur = try r.interface.takeInt(u64, .big);
+                if (cur >= v) {
+                    return .{ .up = i, .last = last };
                 }
+                last = i; // cur < v
                 i += step;
                 step *= 2;
             }
-            return endIndex;
+            return .{ .up = endIndex, .last = last };
         }
 
         // return the first index whose value >= v, if not exist return end
-        fn lowerBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !struct {
-            res: u64,
-            eql: bool,
-        } {
+        fn lowerBound(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !u64 {
             var i = beginIndex;
             var j = endIndex;
             while (j > i) {
@@ -1160,11 +1192,23 @@ fn JournalReader(comptime io: std.Io) type {
                 }
             }
             if (i == endIndex) {
-                return .{ .res = i, .eql = false };
+                return endIndex;
             }
-            try r.seekTo(beginOffset + i * @sizeOf(u64));
-            const u = try r.interface.takeInt(u64, .big);
-            return .{ .res = i, .eql = u == v };
+            return i;
+        }
+
+        // start from startIdx, count num of elements that is equal to v until not equal or out of range
+        fn countEql(r: *std.Io.File.Reader, v: u64, beginOffset: u64, beginIndex: u64, endIndex: u64) !u64 {
+            try r.seekTo(beginOffset + beginIndex * @sizeOf(u64));
+            var i = beginIndex;
+            while (i < endIndex) {
+                const u = try r.interface.takeInt(u64, .big);
+                if (u != v) {
+                    break;
+                }
+                i += 1; // find an equal item, continue
+            }
+            return i - beginIndex;
         }
     };
 }
@@ -1459,15 +1503,36 @@ test "index read/write" {
     const io = testing.io;
     var refs = std.AutoHashMap(Hash, ChunkRef).init(alloc);
     defer refs.deinit();
-    try refs.put(try Hash.parse("00100000000000000000000000000003"), .{
+
+    const h1 = try Hash.parse("00100000000000000000000000000003");
+    const h11 = try Hash.parse("00100000000000000000000000000004");
+    const h2 = try Hash.parse("00200000000000000000000000000002");
+    const h21 = try Hash.parse("00200000000000000000000000000003");
+    const h22 = try Hash.parse("00200000000000000000000000000004");
+    const h3 = try Hash.parse("00300000000000000000000000000001");
+    const hNotExist = try Hash.parse("00400000000000000000000000000000");
+
+    try refs.put(h1, .{
         .offset = 0,
         .size = 10,
     });
-    try refs.put(try Hash.parse("00200000000000000000000000000002"), .{
+    try refs.put(h11, .{
+        .offset = 0,
+        .size = 10,
+    });
+    try refs.put(h2, .{
         .offset = 10,
         .size = 20,
     });
-    try refs.put(try Hash.parse("00300000000000000000000000000001"), .{
+    try refs.put(h21, .{
+        .offset = 10,
+        .size = 20,
+    });
+    try refs.put(h22, .{
+        .offset = 10,
+        .size = 20,
+    });
+    try refs.put(h3, .{
         .offset = 30,
         .size = 30,
     });
@@ -1481,21 +1546,328 @@ test "index read/write" {
     defer w.deinit();
     try w.writeIndex(idx);
     try w.flush();
-    var r = try JournalReader(io).init(alloc, journal);
-    defer r.deinit();
-    const readIdx = try r.readIndex();
+    var r_test = try JournalReader(io).init(alloc, journal);
+    defer r_test.deinit();
+    const readIdx = try r_test.readIndex();
     defer readIdx.deinit();
     try testing.expectEqualDeep(idx, readIdx);
 
-    var r2 = try JournalReader(io).init(alloc, journal);
-    defer r2.deinit();
-    const idxHeader = try r2.skipIndex();
-    try testing.expectEqual(3, idxHeader.count);
+    var r = try JournalReader(io).init(alloc, journal);
+    defer r.deinit();
+    const idxHeader = try r.skipIndex();
+    try testing.expectEqual(refs.count(), idxHeader.count);
     try testing.expectEqual(0, idxHeader.level);
     try testing.expectEqual(0, idxHeader.next);
 
-    try r2.reader.seekTo(0);
+    try r.reader.seekTo(0);
+
+    // search for existing hashes
+    var iter = refs.iterator();
+    while (iter.next()) |e| {
+        try r.reader.seekTo(0);
+        const ref = try r.searchInIndex(e.key_ptr.*);
+        try testing.expect(ref != null);
+        try testing.expectEqual(e.value_ptr.offset, ref.?.offset);
+        try testing.expectEqual(e.value_ptr.size, ref.?.size);
+    }
+
+    // search for non-existing hash
+    try r.reader.seekTo(0);
+    const refNotExist = try r.searchInIndex(hNotExist);
+    try testing.expectEqual(null, refNotExist);
+
+    // search for hash smaller than all entries
+    const hSmall = try Hash.parse("00000000000000000000000000000000");
+    try r.reader.seekTo(0);
+    const refSmall = try r.searchInIndex(hSmall);
+    try testing.expectEqual(null, refSmall);
+
+    // search for hash between existing entries
+    const hBetween = try Hash.parse("00150000000000000000000000000000");
+    try r.reader.seekTo(0);
+    const refBetween = try r.searchInIndex(hBetween);
+    try testing.expectEqual(null, refBetween);
+
+    // test searchManyInIndex
+    var searchPairs = std.ArrayList(HashRefPair).empty;
+    defer searchPairs.deinit(alloc);
+
+    {
+        // search for 3 existing hashes (first in duplicate prefix) + 1 non-existing, sorted by hash
+        defer searchPairs.clearAndFree(alloc);
+        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
+
+        try r.reader.seekTo(0);
+        const found = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(3, found); // only hNotExist is absent
+        try testing.expectEqual(0, searchPairs.items[0].ref.offset);
+        try testing.expectEqual(10, searchPairs.items[0].ref.size);
+        try testing.expectEqual(10, searchPairs.items[1].ref.offset);
+        try testing.expectEqual(20, searchPairs.items[1].ref.size);
+        try testing.expectEqual(30, searchPairs.items[2].ref.offset);
+        try testing.expectEqual(30, searchPairs.items[2].ref.size);
+        try testing.expect(!searchPairs.items[3].ref.isValid()); // hNotExist not found
+    }
+
+    {
+        defer searchPairs.clearAndFree(alloc);
+        // search for existing hashes (may not be the first in duplicated prefix) + 1 non-existing, sorted by hash
+        try searchPairs.append(alloc, .{ .h = h11, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h21, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
+
+        try r.reader.seekTo(0);
+        const found = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(4, found); // only hNotExist is absent
+        try testing.expectEqual(0, searchPairs.items[0].ref.offset);
+        try testing.expectEqual(10, searchPairs.items[0].ref.size);
+        try testing.expectEqual(10, searchPairs.items[1].ref.offset);
+        try testing.expectEqual(20, searchPairs.items[1].ref.size);
+        try testing.expectEqual(10, searchPairs.items[2].ref.offset);
+        try testing.expectEqual(20, searchPairs.items[2].ref.size);
+        try testing.expectEqual(30, searchPairs.items[3].ref.offset);
+        try testing.expectEqual(30, searchPairs.items[3].ref.size);
+        try testing.expect(!searchPairs.items[4].ref.isValid()); // hNotExist not found
+    }
+
+    {
+        defer searchPairs.clearAndFree(alloc);
+        // search all
+        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h11, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h21, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h22, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
+
+        try r.reader.seekTo(0);
+        const found = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(6, found); // only hNotExist is absent
+        for (0..2) |i| {
+            try testing.expectEqual(0, searchPairs.items[i].ref.offset);
+            try testing.expectEqual(10, searchPairs.items[i].ref.size);
+        }
+        for (2..5) |i| {
+            try testing.expectEqual(10, searchPairs.items[i].ref.offset);
+            try testing.expectEqual(20, searchPairs.items[i].ref.size);
+        }
+        for (5..6) |i| {
+            try testing.expectEqual(30, searchPairs.items[i].ref.offset);
+            try testing.expectEqual(30, searchPairs.items[i].ref.size);
+        }
+        try testing.expect(!searchPairs.items[6].ref.isValid()); // hNotExist not found
+    }
+
+    { // search for only non-existing hashes
+        defer searchPairs.clearAndFree(alloc);
+        try searchPairs.append(alloc, .{ .h = hSmall, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
+
+        try r.reader.seekTo(0);
+        const found2 = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(0, found2);
+        try testing.expect(!searchPairs.items[0].ref.isValid());
+        try testing.expect(!searchPairs.items[1].ref.isValid());
+    }
+
+    // search for only h1 and h3, skipping h2
+    {
+        defer searchPairs.clearAndFree(alloc);
+        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
+
+        try r.reader.seekTo(0);
+        const found3 = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(2, found3);
+        try testing.expectEqual(0, searchPairs.items[0].ref.offset);
+        try testing.expectEqual(10, searchPairs.items[0].ref.size);
+        try testing.expectEqual(30, searchPairs.items[1].ref.offset);
+        try testing.expectEqual(30, searchPairs.items[1].ref.size);
+    }
+
+    {
+        defer searchPairs.clearAndFree(alloc);
+        // test with already-found entries (ref.isValid() == true) mixed in
+        // h1 already found (valid ref), h2 not found, h3 already found
+        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef{ .offset = 0, .size = 10 } }); // already valid
+        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef{ .offset = 0, .size = 0 } }); // not found
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef{ .offset = 30, .size = 30 } }); // already valid
+
+        try r.reader.seekTo(0);
+        const found4 = try r.searchManyInIndex(searchPairs);
+        try testing.expectEqual(1, found4); // h2 should be found
+        try testing.expectEqual(10, searchPairs.items[1].ref.offset); // h2 found
+        try testing.expectEqual(20, searchPairs.items[1].ref.size);
+    }
 }
 
-// todo: add test that will trigger auto pending flush and index write.
+// a test that will trigger auto pending flush and index write.
 // and then test with get/getMany/has/hasMany
+test "test everything in JournalStore" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var cs = std.AutoHashMap(Hash, Chunk).init(alloc);
+    defer {
+        var iter = cs.valueIterator();
+        while (iter.next()) |pchunk| {
+            pchunk.deinit(alloc);
+        }
+        cs.deinit();
+    }
+
+    Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
+    const tmpJournalPath = "tmp/testJournalStoreAll/test.zjs";
+    var store = try JournalStore(io).init(alloc, tmpJournalPath);
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
+    defer store.deinit();
+
+    var i: u64 = 0;
+    const totalChunks = 1666;
+    while (i < totalChunks) : (i += 1) {
+        var data: []u8 = undefined;
+        if (i % 3 == 0) {
+            data = try std.fmt.allocPrint(alloc, "data={d}", .{i});
+        } else if (i % 3 == 1) {
+            data = try std.fmt.allocPrint(alloc, "<data>{d:09}</data> ", .{i});
+        } else if (i % 3 == 2) {
+            data = try std.fmt.allocPrint(alloc, "[ \"data\": {d} ]", .{i});
+        }
+        try cs.put(Hash.of(data), try Chunk.init(alloc, data));
+        try store.putMove(Chunk.moveInit(data));
+    }
+
+    try testing.expectEqual(1 + totalChunks / JournalStore(io).MaxJournaledChunksCount, store.indexHeaders.items.len);
+    // try testing.expectEqual(500, store.journaledChunks.count());
+    // try testing.expectEqual(166, store.pending.count());
+
+    const NotExist = Hash.of("not exist");
+    const AlsoNotExist = Hash.of("also not exist");
+    // has
+    var iter = cs.iterator();
+    while (iter.next()) |e| {
+        try testing.expect(try store.has(e.key_ptr.*));
+    }
+    try testing.expect(!try store.has(NotExist));
+
+    // get
+    iter = cs.iterator();
+    while (iter.next()) |e| {
+        const chunk = try store.get(e.key_ptr.*);
+        try testing.expect(chunk != null);
+        defer chunk.?.deinit(alloc);
+        try testing.expectEqualSlices(u8, e.value_ptr.*.data, chunk.?.data);
+    }
+
+    // hasMany
+    var checkSet = HashSet.init(alloc);
+    defer checkSet.deinit();
+    iter = cs.iterator();
+    var count: usize = 0;
+    while (iter.next()) |e| {
+        if (count >= 100) break;
+        try checkSet.put(e.key_ptr.*, {});
+        count += 1;
+    }
+    try checkSet.put(NotExist, {});
+    try checkSet.put(AlsoNotExist, {});
+
+    var absentInvoked: u32 = 0;
+    var absentHashes = HashSet.init(alloc);
+    defer absentHashes.deinit();
+    var onAbsent = struct {
+        pCount: *u32,
+        pHashes: *HashSet,
+        fn invoke(self: *@This(), h: Hash) !void {
+            self.pCount.* += 1;
+            try self.pHashes.put(h, {});
+        }
+    }{ .pCount = &absentInvoked, .pHashes = &absentHashes };
+
+    const absentCount = try store.hasMany(&checkSet, &onAbsent);
+    try testing.expectEqual(2, absentCount);
+    try testing.expectEqual(2, absentInvoked);
+    try testing.expect(absentHashes.contains(NotExist));
+    try testing.expect(absentHashes.contains(AlsoNotExist));
+
+    // -- todo --
+    // getMany
+    // var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+    // defer {
+    //     var fit = foundChunks.valueIterator();
+    //     while (fit.next()) |pchunk| {
+    //         pchunk.deinit(alloc);
+    //     }
+    //     foundChunks.deinit();
+    // }
+    // var onFound = struct {
+    //     pFound: *std.AutoHashMap(Hash, Chunk),
+    //     fn invoke(self: *@This(), chunk: Chunk) !void {
+    //         try self.pFound.put(chunk.getHash(), chunk);
+    //     }
+    // }{ .pFound = &foundChunks };
+
+    // try store.getMany(&checkSet, &onFound);
+
+    // // should find all 100 existing chunks, not the 2 non-existing ones
+    // try testing.expectEqual(100, foundChunks.count());
+
+    // // verify each found chunk has correct data
+    // var fit = foundChunks.iterator();
+    // while (fit.next()) |e| {
+    //     const expected = cs.get(e.key_ptr.*);
+    //     try testing.expect(expected != null);
+    //     try testing.expectEqualSlices(u8, expected.?.data, e.value_ptr.*.data);
+    // }
+
+    // getMany with all non-existing keys
+    // var emptySet = HashSet.init(alloc);
+    // defer emptySet.deinit();
+    // try emptySet.put(NotExist, {});
+    // try emptySet.put(Hash.of("also not exist"), {});
+
+    // var foundChunks2 = std.AutoHashMap(Hash, Chunk).init(alloc);
+    // defer foundChunks2.deinit();
+    // var onFound2 = struct {
+    //     pFound: *std.AutoHashMap(Hash, Chunk),
+    //     fn invoke(self: *@This(), chunk: Chunk) !void {
+    //         try self.pFound.put(chunk.getHash(), chunk);
+    //     }
+    // }{ .pFound = &foundChunks2 };
+    // try store.getMany(&emptySet, &onFound2);
+    // try testing.expectEqual(0, foundChunks2.count());
+
+    // // getMany with mix of existing and non-existing
+    // var mixSet = HashSet.init(alloc);
+    // defer mixSet.deinit();
+    // iter = cs.iterator();
+    // count = 0;
+    // while (iter.next()) |e| {
+    //     if (count >= 50) break;
+    //     try mixSet.put(e.key_ptr.*, {});
+    //     count += 1;
+    // }
+    // try mixSet.put(NotExist, {});
+
+    // var foundChunks3 = std.AutoHashMap(Hash, Chunk).init(alloc);
+    // defer {
+    //     var fit3 = foundChunks3.valueIterator();
+    //     while (fit3.next()) |pchunk| {
+    //         pchunk.deinit(alloc);
+    //     }
+    //     foundChunks3.deinit();
+    // }
+    // var onFound3 = struct {
+    //     pFound: *std.AutoHashMap(Hash, Chunk),
+    //     fn invoke(self: *@This(), chunk: Chunk) !void {
+    //         try self.pFound.put(chunk.getHash(), chunk);
+    //     }
+    // }{ .pFound = &foundChunks3 };
+    // try store.getMany(&mixSet, &onFound3);
+    // try testing.expectEqual(50, foundChunks3.count());
+}
