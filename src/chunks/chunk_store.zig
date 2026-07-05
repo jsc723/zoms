@@ -2173,7 +2173,5 @@ test "test everything in JournalStore" {
 }
 
 // todo
-// index merge -> add some test to see number of index at each level after merge
-// rebase should skip based on index.next -> add some test
 // block cache
 // bloom filter
