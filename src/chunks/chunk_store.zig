@@ -1923,9 +1923,9 @@ test "test everything in JournalStore" {
     const tWrite = std.Io.Timestamp.now(io, .real);
     std.debug.print("[perf] build: {d}ms\n", .{tStart.durationTo(tWrite).toMilliseconds()});
 
-    for (store.indexHeaders.items) |header| {
-        std.debug.print("[debug] level={d}, count={d}\n", .{ header.level, header.count });
-    }
+    // for (store.indexHeaders.items) |header| {
+    //     std.debug.print("[debug] level={d}, count={d}\n", .{ header.level, header.count });
+    // }
     try testing.expectEqual(1 + 2 + 3 + 6, store.indexHeaders.items.len); // 2 level-2, 3 level-1, 6 level-0
     // try testing.expectEqual(500, store.journaledChunks.count());
     // try testing.expectEqual(166, store.pending.count());
@@ -2125,6 +2125,50 @@ test "test everything in JournalStore" {
         }{ .pFound = &foundChunks };
         try store.getMany(&mixSet, &onFound3);
         try testing.expectEqual(50, foundChunks.count());
+    }
+
+    {
+        // test rebase from a store with multi level of index
+        var store2 = try JournalStore(io).init(alloc, tmpJournalPath, .{
+            .MaxPendingChunks = 25,
+            .MaxJournaledChunksCount = 100,
+        });
+        defer store2.deinit();
+
+        try testing.expectEqual(store.indexHeaders.items.len, store2.indexHeaders.items.len);
+
+        // test getMany on a loaded index
+        const tGetManyStart = std.Io.Timestamp.now(io, .real);
+        var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+        defer {
+            var fit = foundChunks.valueIterator();
+            while (fit.next()) |pchunk| {
+                pchunk.deinit(alloc);
+            }
+            foundChunks.deinit();
+        }
+        var onFound = struct {
+            pFound: *std.AutoHashMap(Hash, Chunk),
+            fn invoke(self: *@This(), chunk: Chunk) !void {
+                try self.pFound.put(chunk.getHash(), chunk);
+            }
+        }{ .pFound = &foundChunks };
+
+        try store2.getMany(&checkSet, &onFound);
+
+        const tGetManyEnd = std.Io.Timestamp.now(io, .real);
+        std.debug.print("[perf] getMany: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});
+
+        // should find all 100 existing chunks, not the 2 non-existing ones
+        try testing.expectEqual(100, foundChunks.count());
+
+        // verify each found chunk has correct data
+        var fit = foundChunks.iterator();
+        while (fit.next()) |e| {
+            const expected = cs.get(e.key_ptr.*);
+            try testing.expect(expected != null);
+            try testing.expectEqualSlices(u8, expected.?.data, e.value_ptr.*.data);
+        }
     }
 }
 
