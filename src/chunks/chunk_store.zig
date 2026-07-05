@@ -295,9 +295,9 @@ pub fn JournalStore(comptime io: std.Io) type {
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
         const Self = @This();
-        const MaxJournaledChunksCount = 100; // should be 1000
+        const MaxJournaledChunksCount = 1000;
         const MaxPendingSizeInByte = 1 << 20; // 1mb
-        const MaxPendingChunks = 25; // ~ 1mb should be 250
+        const MaxPendingChunks = 250; // ~ 1mb
 
         pub fn init(alloc: std.mem.Allocator, journalPath: []const u8) !Self {
             const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
@@ -504,21 +504,16 @@ pub fn JournalStore(comptime io: std.Io) type {
             }.less);
             var i = self.indexHeaders.items.len;
             var absent: u64 = @intCast(remaining.items.len);
-            std.debug.print("[debug] remaining.items.len = {d}, indexHeaders.len = {d}\n", .{ remaining.items.len, self.indexHeaders.items.len });
             while (i > 0) {
                 i -= 1;
                 const header = self.indexHeaders.items[i];
                 try r.seekTo(header.offset);
-                std.debug.print("[debug] searching index {d}, offset={d}, count={d}\n", .{ i, header.offset, header.count });
                 const found = try self.journalReader.searchManyInIndex(remaining);
-                std.debug.print("[debug] found={d}, absent={d}\n", .{ found, absent - found });
                 absent -= found;
-                std.debug.print("[debug] absent = {d}\n", .{absent});
                 if (absent == 0) {
                     return 0;
                 }
             }
-            std.debug.print("[debug] ----- \n", .{});
             for (remaining.items) |item| {
                 if (!item.ref.isValid()) {
                     try onAbsent.invoke(item.h);
@@ -1094,25 +1089,13 @@ fn JournalReader(comptime io: std.Io) type {
                 }
                 const h = sortedUniqueHashes.items[i_input].h;
 
-                std.debug.print("[debug] i={d} i_input={d} h={s}\n", .{ i, i_input, h.toString() });
                 const lub = try looseUpperBound(&self.reader, h.prefix(), beginOfPrefix, i, count);
-                std.debug.print("[debug] last{d} up={d}\n", .{ lub.up, lub.last });
                 const res = try lowerBound(&self.reader, h.prefix(), beginOfPrefix, lub.last, lub.up);
-                std.debug.print("[debug] res={d}\n", .{res});
                 if (res == count) {
                     // there is no index who is >= currrent hash, therefore all hashes after this one can be skiped
                     break;
                 }
                 // res points at the first element >= h.prefix()
-                // try self.reader.seekTo(beginOfPrefix + res * Index.PrefixSize);
-                // const verify = try r.takeInt(u64, .big);
-                // if (h.prefix() == verify) {
-                //     // todo: multiple prefix match in index
-                //     try idxAtValidPrefixes.append(self.alloc, .{
-                //         .i_index = res,
-                //         .i_input = i_input,
-                //     });
-                // }
                 const eqCount = try countEql(&self.reader, h.prefix(), beginOfPrefix, res, count);
                 if (eqCount > 0) {
                     try suffixRangeToCheck.append(self.alloc, .{
@@ -1123,7 +1106,6 @@ fn JournalReader(comptime io: std.Io) type {
                 }
                 i = res; // because res is the first place whose value >= current input hash prefix
             }
-            std.debug.print("-----\n", .{});
             // verify idxAtValidPrefixes in suffix
             var idxAtValidSuffixes = try std.ArrayList(CheckedIndex).initCapacity(self.alloc, suffixRangeToCheck.items.len);
             defer idxAtValidSuffixes.deinit(self.alloc);
@@ -1728,7 +1710,7 @@ test "test everything in JournalStore" {
     defer store.deinit();
 
     var i: u64 = 0;
-    const totalChunks = 1666;
+    const totalChunks = 10666;
     while (i < totalChunks) : (i += 1) {
         var data: []u8 = undefined;
         if (i % 3 == 0) {
@@ -1795,79 +1777,121 @@ test "test everything in JournalStore" {
     try testing.expect(absentHashes.contains(NotExist));
     try testing.expect(absentHashes.contains(AlsoNotExist));
 
-    // -- todo --
     // getMany
-    // var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
-    // defer {
-    //     var fit = foundChunks.valueIterator();
-    //     while (fit.next()) |pchunk| {
-    //         pchunk.deinit(alloc);
-    //     }
-    //     foundChunks.deinit();
-    // }
-    // var onFound = struct {
-    //     pFound: *std.AutoHashMap(Hash, Chunk),
-    //     fn invoke(self: *@This(), chunk: Chunk) !void {
-    //         try self.pFound.put(chunk.getHash(), chunk);
-    //     }
-    // }{ .pFound = &foundChunks };
+    {
+        var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+        defer {
+            var fit = foundChunks.valueIterator();
+            while (fit.next()) |pchunk| {
+                pchunk.deinit(alloc);
+            }
+            foundChunks.deinit();
+        }
+        var onFound = struct {
+            pFound: *std.AutoHashMap(Hash, Chunk),
+            fn invoke(self: *@This(), chunk: Chunk) !void {
+                try self.pFound.put(chunk.getHash(), chunk);
+            }
+        }{ .pFound = &foundChunks };
 
-    // try store.getMany(&checkSet, &onFound);
+        try store.getMany(&checkSet, &onFound);
 
-    // // should find all 100 existing chunks, not the 2 non-existing ones
-    // try testing.expectEqual(100, foundChunks.count());
+        // should find all 100 existing chunks, not the 2 non-existing ones
+        try testing.expectEqual(100, foundChunks.count());
 
-    // // verify each found chunk has correct data
-    // var fit = foundChunks.iterator();
-    // while (fit.next()) |e| {
-    //     const expected = cs.get(e.key_ptr.*);
-    //     try testing.expect(expected != null);
-    //     try testing.expectEqualSlices(u8, expected.?.data, e.value_ptr.*.data);
-    // }
+        // verify each found chunk has correct data
+        var fit = foundChunks.iterator();
+        while (fit.next()) |e| {
+            const expected = cs.get(e.key_ptr.*);
+            try testing.expect(expected != null);
+            try testing.expectEqualSlices(u8, expected.?.data, e.value_ptr.*.data);
+        }
+    }
+
+    // getMany finds all
+    {
+        var allHashes = HashSet.init(alloc);
+        defer allHashes.deinit();
+        iter = cs.iterator();
+        while (iter.next()) |e| {
+            try allHashes.put(e.key_ptr.*, {});
+        }
+        var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+        defer {
+            var fit = foundChunks.valueIterator();
+            while (fit.next()) |pchunk| {
+                pchunk.deinit(alloc);
+            }
+            foundChunks.deinit();
+        }
+        var onFound = struct {
+            pFound: *std.AutoHashMap(Hash, Chunk),
+            fn invoke(self: *@This(), chunk: Chunk) !void {
+                try self.pFound.put(chunk.getHash(), chunk);
+            }
+        }{ .pFound = &foundChunks };
+
+        try store.getMany(&allHashes, &onFound);
+
+        // should find all chunks in cs
+        try testing.expectEqual(cs.count(), foundChunks.count());
+
+        // verify each found chunk has correct data
+        var fit = foundChunks.iterator();
+        while (fit.next()) |e| {
+            const expected = cs.get(e.key_ptr.*);
+            try testing.expect(expected != null);
+            try testing.expectEqualSlices(u8, expected.?.data, e.value_ptr.*.data);
+        }
+    }
 
     // getMany with all non-existing keys
-    // var emptySet = HashSet.init(alloc);
-    // defer emptySet.deinit();
-    // try emptySet.put(NotExist, {});
-    // try emptySet.put(Hash.of("also not exist"), {});
+    {
+        var emptySet = HashSet.init(alloc);
+        defer emptySet.deinit();
+        try emptySet.put(NotExist, {});
+        try emptySet.put(Hash.of("also not exist"), {});
 
-    // var foundChunks2 = std.AutoHashMap(Hash, Chunk).init(alloc);
-    // defer foundChunks2.deinit();
-    // var onFound2 = struct {
-    //     pFound: *std.AutoHashMap(Hash, Chunk),
-    //     fn invoke(self: *@This(), chunk: Chunk) !void {
-    //         try self.pFound.put(chunk.getHash(), chunk);
-    //     }
-    // }{ .pFound = &foundChunks2 };
-    // try store.getMany(&emptySet, &onFound2);
-    // try testing.expectEqual(0, foundChunks2.count());
+        var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+        defer foundChunks.deinit();
+        var onFound2 = struct {
+            pFound: *std.AutoHashMap(Hash, Chunk),
+            fn invoke(self: *@This(), chunk: Chunk) !void {
+                try self.pFound.put(chunk.getHash(), chunk);
+            }
+        }{ .pFound = &foundChunks };
+        try store.getMany(&emptySet, &onFound2);
+        try testing.expectEqual(0, foundChunks.count());
+    }
 
-    // // getMany with mix of existing and non-existing
-    // var mixSet = HashSet.init(alloc);
-    // defer mixSet.deinit();
-    // iter = cs.iterator();
-    // count = 0;
-    // while (iter.next()) |e| {
-    //     if (count >= 50) break;
-    //     try mixSet.put(e.key_ptr.*, {});
-    //     count += 1;
-    // }
-    // try mixSet.put(NotExist, {});
+    // getMany with mix of existing and non-existing
+    {
+        var mixSet = HashSet.init(alloc);
+        defer mixSet.deinit();
+        iter = cs.iterator();
+        count = 0;
+        while (iter.next()) |e| {
+            if (count >= 50) break;
+            try mixSet.put(e.key_ptr.*, {});
+            count += 1;
+        }
+        try mixSet.put(NotExist, {});
 
-    // var foundChunks3 = std.AutoHashMap(Hash, Chunk).init(alloc);
-    // defer {
-    //     var fit3 = foundChunks3.valueIterator();
-    //     while (fit3.next()) |pchunk| {
-    //         pchunk.deinit(alloc);
-    //     }
-    //     foundChunks3.deinit();
-    // }
-    // var onFound3 = struct {
-    //     pFound: *std.AutoHashMap(Hash, Chunk),
-    //     fn invoke(self: *@This(), chunk: Chunk) !void {
-    //         try self.pFound.put(chunk.getHash(), chunk);
-    //     }
-    // }{ .pFound = &foundChunks3 };
-    // try store.getMany(&mixSet, &onFound3);
-    // try testing.expectEqual(50, foundChunks3.count());
+        var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+        defer {
+            var fit3 = foundChunks.valueIterator();
+            while (fit3.next()) |pchunk| {
+                pchunk.deinit(alloc);
+            }
+            foundChunks.deinit();
+        }
+        var onFound3 = struct {
+            pFound: *std.AutoHashMap(Hash, Chunk),
+            fn invoke(self: *@This(), chunk: Chunk) !void {
+                try self.pFound.put(chunk.getHash(), chunk);
+            }
+        }{ .pFound = &foundChunks };
+        try store.getMany(&mixSet, &onFound3);
+        try testing.expectEqual(50, foundChunks.count());
+    }
 }
