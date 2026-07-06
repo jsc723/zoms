@@ -8,7 +8,7 @@ const hash = @import("hash");
 const Chunk = chunks.Chunk;
 const Hash = hash.Hash;
 pub const HashChunkMap = std.AutoHashMap(Hash, Chunk);
-const HashSet = Hash.Set;
+pub const HashSet = Hash.Set;
 
 pub fn ChunkStore(comptime io: std.Io) type {
     return union(enum) {

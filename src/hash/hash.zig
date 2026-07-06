@@ -46,6 +46,13 @@ pub const Hash = struct {
         return h;
     }
 
+    // used for c-binding (hasher may not be blake3)
+    pub fn fromOther(data: [*]const u8) Hash {
+        var h = Hash.Empty;
+        std.mem.copyForwards(u8, &h.bytes, data[0..20]);
+        return h;
+    }
+
     pub fn ofNumber(comptime T: type, num: T) Hash {
         var buf: [@sizeOf(T)]u8 = .{0} ** @sizeOf(T);
         std.mem.writeInt(T, &buf, num, .big);
