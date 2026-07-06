@@ -29,6 +29,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
         },
     });
+    const zjs_lib = b.addLibrary(.{
+        .name = "zjs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/chunks/c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hash", .module = hash_mod },
+                .{ .name = "util", .module = util_mod },
+            },
+            .link_libc = true,
+        }),
+        .linkage = .static,
+    });
+    b.installArtifact(zjs_lib);
+    const install_header = b.addInstallHeaderFile(b.path("src/chunks/zjs.h"), "zjs.h");
+    b.getInstallStep().dependOn(&install_header.step);
+
     const mod = b.addModule("zoms", .{ .root_source_file = b.path("src/root.zig"), .target = target, .imports = &.{
         .{ .name = "hash", .module = hash_mod },
         .{ .name = "chunks", .module = chunks_mod },
