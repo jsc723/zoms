@@ -18,3 +18,10 @@ void journalStore_getMany(
     JournalSlice* out_slices,     // ?[*]JournalSlice
     size_t len                    // usize
 );
+
+void journalStore_hasMany(
+    void* handle,                 // ?*anyopaque
+    char** keys,                  // ?[*]?[*]u8 (array of mutable C-strings)
+    bool* out_has,                // ?[*]bool
+    size_t len                    // usize
+);

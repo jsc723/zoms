@@ -39,6 +39,58 @@ pub const JournalSlice = extern struct {
     len: usize,
 };
 
+export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]bool, len: usize) u64 {
+    if (handle == null) {
+        std.debug.print("ZJS Error: handle is null\n", .{});
+        return 0;
+    }
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle.?));
+    var keyset = chunks.HashSet.init(std.heap.c_allocator);
+    defer keyset.deinit();
+    keyset.ensureTotalCapacity(@intCast(len)) catch {
+        std.debug.print("ZJS Error: failed to ensure capacity for keyset\n", .{});
+        return 0;
+    };
+    var idxMap = std.AutoHashMap(Hash, u64).init(std.heap.c_allocator);
+    defer idxMap.deinit();
+    idxMap.ensureTotalCapacity(@intCast(len)) catch {
+        std.debug.print("ZJS Error: failed to ensure capacity for idxMap\n", .{});
+        return 0;
+    };
+    for (0..len) |i| {
+        const pHash = keys.?[i].?;
+        const h = Hash.fromOther(pHash);
+        keyset.put(h, {}) catch {
+            std.debug.print("ZJS Error: keyset put failed\n", .{});
+            return 0;
+        };
+        idxMap.put(h, i) catch {
+            std.debug.print("ZJS Error: idxMap put failed\n", .{});
+            return 0;
+        };
+    }
+    for (0..len) |i| {
+        out.?[i] = true;
+    }
+    const Context = struct {
+        idxMap: *std.AutoHashMap(Hash, u64),
+        out: [*]bool,
+        pub fn invoke(self: *@This(), h: Hash) !void {
+            const i = self.idxMap.get(h).?;
+            self.out[i] = false;
+        }
+    };
+    var ctx = Context{
+        .idxMap = &idxMap,
+        .out = out.?,
+    };
+    const absent = store.hasMany(&keyset, &ctx) catch |e| {
+        std.debug.print("ZJS Error: hasMany failed {any}\n", .{e});
+        return 0;
+    };
+    return absent;
+}
+
 export fn journalStore_getMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out_slices: ?[*]JournalSlice, len: usize) void {
     if (handle == null) {
         std.debug.print("ZJS Error: handle is null\n", .{});
