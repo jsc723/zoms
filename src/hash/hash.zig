@@ -1,10 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 const blake3 = std.crypto.hash.Blake3;
+const sha512 = std.crypto.hash.sha2.Sha512;
 const encoding = @import("base32.zig");
 
 const ByteLen = 20;
 const StringLen = 32;
+const useNomsCompatibleHash = true; // todo make this a build option
 
 pub const Hash = struct {
     bytes: [ByteLen]u8,
@@ -41,8 +43,29 @@ pub const Hash = struct {
 
     pub fn of(data: []const u8) Hash {
         var h = Hash.Empty;
-        // truncate first 20 bytes of blake3 hash (which has 32 bytes). The library does truncate automatically.
-        blake3.hash(data, &h.bytes, .{});
+        if (comptime useNomsCompatibleHash) {
+            var buf: [64]u8 = .{0} ** 64;
+            // truncate first 20 bytes of sha512.
+            sha512.hash(data, &buf, .{});
+            std.mem.copyForwards(u8, &h.bytes, buf[0..20]);
+        } else {
+            // truncate first 20 bytes of blake3 hash (which has 32 bytes). The library does truncate automatically.
+            blake3.hash(data, &h.bytes, .{});
+        }
+        return h;
+    }
+
+    pub fn ofNumber(comptime T: type, num: T) Hash {
+        var data: [@sizeOf(T)]u8 = .{0} ** @sizeOf(T);
+        std.mem.writeInt(T, &data, num, .big);
+        var h = Hash.Empty;
+        if (comptime useNomsCompatibleHash) {
+            var buf: [64]u8 = .{0} ** 64;
+            sha512.hash(&data, &buf, .{});
+            std.mem.copyForwards(u8, &h.bytes, buf[0..20]);
+        } else {
+            blake3.hash(&data, &h.bytes, .{});
+        }
         return h;
     }
 
@@ -50,14 +73,6 @@ pub const Hash = struct {
     pub fn fromOther(data: [*]const u8) Hash {
         var h = Hash.Empty;
         std.mem.copyForwards(u8, &h.bytes, data[0..20]);
-        return h;
-    }
-
-    pub fn ofNumber(comptime T: type, num: T) Hash {
-        var buf: [@sizeOf(T)]u8 = .{0} ** @sizeOf(T);
-        std.mem.writeInt(T, &buf, num, .big);
-        var h = Hash.Empty;
-        blake3.hash(&buf, &h.bytes, .{});
         return h;
     }
 

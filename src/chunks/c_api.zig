@@ -24,20 +24,64 @@ export fn journalStore_deinit(handle: ?*anyopaque) void {
 }
 
 // todo: provide hash of data
-export fn journalStore_put(handle: ?*anyopaque, hash: [*]const u8, data: [*]const u8, len: usize) bool {
-    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle orelse return false));
-    const chunk = Chunk.initWithHash(std.heap.c_allocator, data[0..len], Hash.fromOther(hash)) catch return false;
+export fn journalStore_put(handle: ?*anyopaque, hash: [*]const u8, data: [*]const u8, len: usize) void {
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle orelse return));
+    const chunk = Chunk.initWithHash(std.heap.c_allocator, data[0..len], Hash.fromOther(hash)) catch return;
     store.putMove(chunk) catch {
         chunk.deinit(std.heap.c_allocator);
-        return false;
+        return;
     };
-    return true;
 }
 
 pub const JournalSlice = extern struct {
     ptr: ?[*]const u8,
     len: usize,
 };
+
+// pub fn commit(self: *Self, current: Hash, last: Hash) !bool
+export fn journalStore_commit(handle: ?*anyopaque, current: [*]const u8, last: [*]const u8) u32 {
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle orelse return 0));
+    const hCurrent = Hash.fromOther(current);
+    const hLast = Hash.fromOther(last);
+    const res = store.commit(hCurrent, hLast) catch |e| {
+        std.debug.print("ZJS Error: commit failed {any}\n", .{e});
+        return 0;
+    };
+    if (res) {
+        return 1;
+    }
+    return 0;
+}
+
+export fn journalStore_root(handle: ?*anyopaque, out: [*]u8) void {
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle orelse return));
+    const res = store.root() catch |e| {
+        std.debug.print("ZJS Error: commit failed {any}\n", .{e});
+        return;
+    };
+    std.mem.copyForwards(u8, out[0..20], res.bytes[0..20]);
+}
+
+export fn journalStore_rebase(handle: ?*anyopaque) void {
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle orelse return));
+    store.rebase() catch |e| {
+        std.debug.print("ZJS Error: rebase failed {any}\n", .{e});
+        return;
+    };
+}
+
+export fn journalStore_has(handle: ?*anyopaque, key: ?[*]u8) bool {
+    if (handle == null) {
+        std.debug.print("ZJS Error: handle is null\n", .{});
+        return false;
+    }
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle.?));
+    const h = Hash.fromOther(key.?);
+    return store.has(h) catch |e| {
+        std.debug.print("ZJS Error: has failed {any}\n", .{e});
+        return false;
+    };
+}
 
 export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]bool, len: usize) u64 {
     if (handle == null) {
@@ -89,6 +133,25 @@ export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]b
         return 0;
     };
     return absent;
+}
+
+export fn journalStore_get(handle: ?*anyopaque, key: ?[*]u8, out: ?*JournalSlice) void {
+    if (handle == null) {
+        std.debug.print("ZJS Error: handle is null\n", .{});
+        return;
+    }
+    const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle.?));
+    const h = Hash.fromOther(key.?);
+    const res = store.get(h) catch |e| {
+        std.debug.print("ZJS Error: get failed {any}\n", .{e});
+        return;
+    };
+    if (res) |chunk| {
+        out.?.* = JournalSlice{
+            .ptr = chunk.data.ptr,
+            .len = chunk.data.len,
+        };
+    }
 }
 
 export fn journalStore_getMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out_slices: ?[*]JournalSlice, len: usize) void {

@@ -1881,6 +1881,53 @@ test "index read/write" {
     }
 }
 
+test "test JournalStore commit then getMany" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    Dir.cwd().deleteTree(io, "tmp/testJournalStoreCommitGetMany") catch {};
+    const tmpJournalPath = "tmp/testJournalStoreCommitGetMany/test.zjs";
+    var store = try JournalStore(io).init(alloc, tmpJournalPath, .{
+        .MaxPendingChunks = 25,
+        .MaxJournaledChunksCount = 100,
+    });
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalStoreCommitGetMany") catch {};
+    defer store.deinit();
+
+    const c1 = try Chunk.init(alloc, "hello");
+    const c2 = try Chunk.init(alloc, "world");
+    const c3 = try Chunk.init(alloc, "foo");
+    try store.putMove(c1);
+    try store.putMove(c2);
+    try store.putMove(c3);
+    const ok = try store.commit(Hash.of("v1"), try store.root());
+    try testing.expect(ok);
+
+    var checkSet = HashSet.init(alloc);
+    defer checkSet.deinit();
+
+    try checkSet.put(c1.h, {});
+    try checkSet.put(c2.h, {});
+    try checkSet.put(c3.h, {});
+
+    var foundChunks = std.AutoHashMap(Hash, Chunk).init(alloc);
+    defer {
+        var fit = foundChunks.valueIterator();
+        while (fit.next()) |pchunk| {
+            pchunk.deinit(alloc);
+        }
+        foundChunks.deinit();
+    }
+    var onFound = struct {
+        pFound: *std.AutoHashMap(Hash, Chunk),
+        fn invoke(self: *@This(), chunk: Chunk) !void {
+            try self.pFound.put(chunk.getHash(), chunk);
+        }
+    }{ .pFound = &foundChunks };
+
+    try store.getMany(&checkSet, &onFound);
+}
+
 // a test that will trigger auto pending flush and index write.
 // and then test with get/getMany/has/hasMany
 test "test everything in JournalStore" {
