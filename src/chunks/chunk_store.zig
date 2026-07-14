@@ -294,6 +294,9 @@ pub fn JournalStore(comptime io: std.Io) type {
         journaledChunks: std.AutoHashMap(Hash, ChunkRef), // commited chunks (but not indexed)
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
+        getManyCalled: i64,
+        getManyDuration: std.Io.Duration,
+
         const Self = @This();
         const Config = struct {
             MaxJournaledChunksCount: u32 = 1000,
@@ -322,6 +325,8 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .journalWriter = writer,
                 .journaledChunks = .init(alloc),
                 .indexHeaders = .empty,
+                .getManyCalled = 0,
+                .getManyDuration = std.Io.Duration.zero,
             };
 
             try self.rebase();
@@ -341,24 +346,37 @@ pub fn JournalStore(comptime io: std.Io) type {
             return .{ .journalStore = self };
         }
 
+        fn headersCopy(self: *Self) !std.ArrayList(IndexHeader) {
+            var headers = try std.ArrayList(IndexHeader).initCapacity(self.alloc, self.indexHeaders.items.len);
+            for (0..self.indexHeaders.items.len) |i| {
+                try headers.append(self.alloc, self.indexHeaders.items[i]);
+            }
+            return headers;
+        }
+
         pub fn get(self: *Self, key: Hash) !?Chunk {
-            try self.mu.lock(io);
-            defer self.mu.unlock(io);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
-            if (self.pending.get(key)) |val| {
-                return try Chunk.init(self.alloc, val.data);
+            var headers = std.ArrayList(IndexHeader).empty;
+            defer headers.deinit(self.alloc);
+            {
+                try self.mu.lock(io);
+                defer self.mu.unlock(io);
+                if (self.pending.get(key)) |val| {
+                    return try Chunk.init(self.alloc, val.data);
+                }
+                if (self.journaledChunks.get(key)) |info| {
+                    try r.seekTo(info.offset);
+                    const data = try r.interface.readAlloc(self.alloc, info.size);
+                    return Chunk.moveInit(data);
+                }
+                headers = try self.headersCopy();
             }
-            if (self.journaledChunks.get(key)) |info| {
-                try r.seekTo(info.offset);
-                const data = try r.interface.readAlloc(self.alloc, info.size);
-                return Chunk.moveInit(data);
-            }
-            var i = self.indexHeaders.items.len;
+            var i = headers.items.len;
             while (i > 0) {
                 i -= 1;
-                const header = self.indexHeaders.items[i];
+                const header = headers.items[i];
                 try r.seekTo(header.offset);
                 const maybeRef = try journalReader.searchInIndex(key);
                 if (maybeRef) |ref| {
@@ -371,34 +389,49 @@ pub fn JournalStore(comptime io: std.Io) type {
         }
 
         pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
-            try self.mu.lock(io);
-            defer self.mu.unlock(io);
-
-            var iter = keys.keyIterator();
+            self.getManyCalled += 1;
+            const t0 = std.Io.Timestamp.now(io, .real);
+            defer {
+                const t1 = std.Io.Timestamp.now(io, .real);
+                const d = t0.durationTo(t1);
+                self.getManyDuration = std.Io.Duration.fromNanoseconds(self.getManyDuration.toNanoseconds() + d.toNanoseconds());
+            }
             var journaledRefs = std.ArrayList(HashRefPair).empty;
             defer journaledRefs.deinit(self.alloc);
             var remaining = std.ArrayList(HashRefPair).empty;
             defer remaining.deinit(self.alloc);
+
+            var headers = std.ArrayList(IndexHeader).empty;
+            defer headers.deinit(self.alloc);
+
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
-            while (iter.next()) |pk| {
-                if (self.pending.get(pk.*)) |foundChunk| {
-                    try onFound.invoke(try Chunk.initWithHash(self.alloc, foundChunk.data, pk.*));
-                } else if (self.journaledChunks.get(pk.*)) |ref| {
-                    try journaledRefs.append(self.alloc, .{
-                        .h = pk.*,
-                        .ref = ref,
-                    });
-                } else {
-                    try remaining.append(self.alloc, .{
-                        .h = pk.*,
-                        .ref = ChunkRef{
-                            .offset = 0,
-                            .size = 0,
-                        },
-                    });
+            {
+                try self.mu.lock(io);
+                defer self.mu.unlock(io);
+
+                var iter = keys.keyIterator();
+                while (iter.next()) |pk| {
+                    if (self.pending.get(pk.*)) |foundChunk| {
+                        try onFound.invoke(try Chunk.initWithHash(self.alloc, foundChunk.data, pk.*));
+                    } else if (self.journaledChunks.get(pk.*)) |ref| {
+                        try journaledRefs.append(self.alloc, .{
+                            .h = pk.*,
+                            .ref = ref,
+                        });
+                    } else {
+                        try remaining.append(self.alloc, .{
+                            .h = pk.*,
+                            .ref = ChunkRef{
+                                .offset = 0,
+                                .size = 0,
+                            },
+                        });
+                    }
                 }
+
+                headers = try self.headersCopy();
             }
             std.mem.sortUnstable(HashRefPair, journaledRefs.items, {}, struct {
                 fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
@@ -410,11 +443,11 @@ pub fn JournalStore(comptime io: std.Io) type {
                     return a.h.compare(b.h) == .lt;
                 }
             }.less);
-            var i = self.indexHeaders.items.len;
+            var i = headers.items.len;
             var absent = remaining.items.len;
             while (i > 0) {
                 i -= 1;
-                const header = self.indexHeaders.items[i];
+                const header = headers.items[i];
                 try r.seekTo(header.offset);
                 const found = try journalReader.searchManyInIndex(remaining);
                 absent -= found;
@@ -462,18 +495,23 @@ pub fn JournalStore(comptime io: std.Io) type {
         }
 
         pub fn has(self: *Self, key: Hash) !bool {
-            try self.mu.lock(io);
-            defer self.mu.unlock(io);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
-            if (self.pending.contains(key) or self.journaledChunks.contains(key)) {
-                return true;
+            var headers = std.ArrayList(IndexHeader).empty;
+            defer headers.deinit(self.alloc);
+            {
+                try self.mu.lock(io);
+                defer self.mu.unlock(io);
+                if (self.pending.contains(key) or self.journaledChunks.contains(key)) {
+                    return true;
+                }
+                headers = try self.headersCopy();
             }
-            var i = self.indexHeaders.items.len;
+            var i = headers.items.len;
             while (i > 0) {
                 i -= 1;
-                const header = self.indexHeaders.items[i];
+                const header = headers.items[i];
                 try r.seekTo(header.offset);
                 const maybeRef = try journalReader.searchInIndex(key);
                 if (maybeRef != null) {
@@ -484,37 +522,43 @@ pub fn JournalStore(comptime io: std.Io) type {
         }
 
         pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u64 {
-            try self.mu.lock(io);
-            defer self.mu.unlock(io);
-            var iter = keys.keyIterator();
             var remaining = std.ArrayList(HashRefPair).empty;
             defer remaining.deinit(self.alloc);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
+            var headers = std.ArrayList(IndexHeader).empty;
+            defer headers.deinit(self.alloc);
+            {
+                try self.mu.lock(io);
+                defer self.mu.unlock(io);
+                var iter = keys.keyIterator();
 
-            while (iter.next()) |pk| {
-                if (self.pending.contains(pk.*) or self.journaledChunks.contains(pk.*)) {
-                    continue;
+                while (iter.next()) |pk| {
+                    if (self.pending.contains(pk.*) or self.journaledChunks.contains(pk.*)) {
+                        continue;
+                    }
+                    try remaining.append(self.alloc, .{
+                        .h = pk.*,
+                        .ref = ChunkRef{
+                            .offset = 0,
+                            .size = 0,
+                        },
+                    });
                 }
-                try remaining.append(self.alloc, .{
-                    .h = pk.*,
-                    .ref = ChunkRef{
-                        .offset = 0,
-                        .size = 0,
-                    },
-                });
+
+                headers = try self.headersCopy();
             }
             std.mem.sortUnstable(HashRefPair, remaining.items, {}, struct {
                 fn less(_: void, a: HashRefPair, b: HashRefPair) bool {
                     return a.h.compare(b.h) == .lt;
                 }
             }.less);
-            var i = self.indexHeaders.items.len;
+            var i = headers.items.len;
             var absent: u64 = @intCast(remaining.items.len);
             while (i > 0) {
                 i -= 1;
-                const header = self.indexHeaders.items[i];
+                const header = headers.items[i];
                 try r.seekTo(header.offset);
                 const found = try journalReader.searchManyInIndex(remaining);
                 absent -= found;
