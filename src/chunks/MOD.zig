@@ -8,4 +8,5 @@ pub const HashChunkMap = chunk_store.HashChunkMap;
 test {
     _ = @import("chunks.zig");
     _ = @import("chunk_store.zig");
+    _ = @import("mmap.zig");
 }
