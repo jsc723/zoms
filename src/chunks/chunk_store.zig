@@ -731,6 +731,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 try journalReader.reader.seekTo(self.indexHeaders.items[begin - 1].offset);
                 try self.journalWriter.updateIndexHeader(self.indexHeaders.items[begin - 1], &journalReader.reader);
                 try self.journalWriter.writeIndex(merged);
+                try self.journal.sync(io);
 
                 count = mergableIndices(self.indexHeaders, self.config.IndexBranchingFactor);
             }
