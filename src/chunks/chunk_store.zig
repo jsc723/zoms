@@ -5,6 +5,8 @@ const path = std.Io.Dir.path;
 const openOrCreateFile = @import("util").file.openOrCreateFile;
 const chunks = @import("chunks.zig");
 const hash = @import("hash");
+const mmap = @import("mmap.zig");
+const MappedSlice = mmap.MappedSlice;
 const Chunk = chunks.Chunk;
 const Hash = hash.Hash;
 pub const HashChunkMap = std.AutoHashMap(Hash, Chunk);
@@ -795,6 +797,7 @@ pub fn JournalStore(comptime io: std.Io) type {
 
             try self.journalWriter.writeRootNoFlush(current);
             try self.journalWriter.writer.flush();
+            try self.journal.sync(io);
             self.rootHash = current;
 
             return true;
@@ -2233,6 +2236,8 @@ test "test everything in JournalStore" {
         try store.getMany(&mixSet, &onFound3);
         try testing.expectEqual(50, foundChunks.count());
     }
+
+    _ = try store.commit(Hash.of("v2"), try store.root());
 
     {
         // test rebase from a store with multi level of index
