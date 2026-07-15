@@ -6,7 +6,7 @@ const openOrCreateFile = @import("util").file.openOrCreateFile;
 const chunks = @import("chunks.zig");
 const hash = @import("hash");
 const mmap = @import("mmap.zig");
-const MappedSlice = mmap.MappedSlice;
+const PSharedMappedSlice = *mmap.SharedMappedSlice;
 const Chunk = chunks.Chunk;
 const Hash = hash.Hash;
 pub const HashChunkMap = std.AutoHashMap(Hash, Chunk);
@@ -294,6 +294,7 @@ pub fn JournalStore(comptime io: std.Io) type {
         pendingSize: u64,
         pending: HashChunkMap, // in memory not committed chunks
         journaledChunks: std.AutoHashMap(Hash, ChunkRef), // commited chunks (but not indexed)
+
         indexHeaders: std.ArrayList(IndexHeader), // indexes
 
         getManyCalled: i64,
@@ -340,6 +341,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             self.pending.deinit();
             self.journalWriter.deinit();
             self.journaledChunks.deinit();
+            deinitHeaders(&self.indexHeaders);
             self.indexHeaders.deinit(self.alloc);
             self.journal.close(io);
         }
@@ -348,10 +350,16 @@ pub fn JournalStore(comptime io: std.Io) type {
             return .{ .journalStore = self };
         }
 
+        fn deinitHeaders(headers: *std.ArrayList(IndexHeader)) void {
+            for (headers.items) |h| {
+                h.deinit();
+            }
+        }
+
         fn headersCopy(self: *Self) !std.ArrayList(IndexHeader) {
             var headers = try std.ArrayList(IndexHeader).initCapacity(self.alloc, self.indexHeaders.items.len);
             for (0..self.indexHeaders.items.len) |i| {
-                try headers.append(self.alloc, self.indexHeaders.items[i]);
+                try headers.append(self.alloc, self.indexHeaders.items[i].clone());
             }
             return headers;
         }
@@ -361,7 +369,12 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer journalReader.deinit();
             var r = &journalReader.reader;
             var headers = std.ArrayList(IndexHeader).empty;
-            defer headers.deinit(self.alloc);
+            defer {
+                for (headers.items) |*header| {
+                    header.deinit();
+                }
+                headers.deinit(self.alloc);
+            }
             {
                 try self.mu.lock(io);
                 defer self.mu.unlock(io);
@@ -404,7 +417,12 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer remaining.deinit(self.alloc);
 
             var headers = std.ArrayList(IndexHeader).empty;
-            defer headers.deinit(self.alloc);
+            defer {
+                for (headers.items) |*header| {
+                    header.deinit();
+                }
+                headers.deinit(self.alloc);
+            }
 
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
@@ -501,7 +519,12 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer journalReader.deinit();
             var r = &journalReader.reader;
             var headers = std.ArrayList(IndexHeader).empty;
-            defer headers.deinit(self.alloc);
+            defer {
+                for (headers.items) |*header| {
+                    header.deinit();
+                }
+                headers.deinit(self.alloc);
+            }
             {
                 try self.mu.lock(io);
                 defer self.mu.unlock(io);
@@ -530,7 +553,12 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer journalReader.deinit();
             var r = &journalReader.reader;
             var headers = std.ArrayList(IndexHeader).empty;
-            defer headers.deinit(self.alloc);
+            defer {
+                for (headers.items) |*header| {
+                    header.deinit();
+                }
+                headers.deinit(self.alloc);
+            }
             {
                 try self.mu.lock(io);
                 defer self.mu.unlock(io);
@@ -594,6 +622,7 @@ pub fn JournalStore(comptime io: std.Io) type {
         pub fn rebase(self: *Self) !void {
             try self.mu.lock(io);
             defer self.mu.unlock(io);
+            deinitHeaders(&self.indexHeaders);
             self.indexHeaders.clearAndFree(self.alloc);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
@@ -667,12 +696,14 @@ pub fn JournalStore(comptime io: std.Io) type {
                 defer idx.deinit();
                 const idxOffset = self.journalWriter.writer.logicalPos();
                 try self.journalWriter.writeIndex(idx);
+                const idxEndOffset = self.journalWriter.writer.logicalPos();
                 try self.journalWriter.writer.flush();
                 try self.indexHeaders.append(self.alloc, .{
                     .offset = idxOffset,
                     .count = idx.count,
                     .level = idx.level,
                     .next = idx.next,
+                    .mapped = try .init(self.alloc, self.journal, idxOffset, idxEndOffset - idxOffset),
                 });
                 const previousHeaderIndex = self.indexHeaders.items.len - 2;
                 self.indexHeaders.items[previousHeaderIndex].next = idxOffset;
@@ -718,6 +749,12 @@ pub fn JournalStore(comptime io: std.Io) type {
                 const merged = try mergeIndexInMemory(self.alloc, indices);
                 defer merged.deinit();
                 const startOfMerged = self.journalWriter.writer.logicalPos();
+                try self.journalWriter.writeIndex(merged);
+                const endOfMerged = self.journalWriter.writer.logicalPos();
+
+                for (begin..end) |i| {
+                    self.indexHeaders.items[i].deinit();
+                }
                 try self.indexHeaders.resize(self.alloc, begin + 1); // + 1for the merged header
                 // replace the it with the merged header
                 self.indexHeaders.items[begin] = IndexHeader{
@@ -725,12 +762,12 @@ pub fn JournalStore(comptime io: std.Io) type {
                     .count = merged.count,
                     .level = merged.level,
                     .next = merged.next,
+                    .mapped = try mmap.SharedMappedSlice.init(self.alloc, self.journal, startOfMerged, endOfMerged - startOfMerged),
                 };
                 // update the prev's header's next field to point to the merged index
                 self.indexHeaders.items[begin - 1].next = startOfMerged;
                 try journalReader.reader.seekTo(self.indexHeaders.items[begin - 1].offset);
                 try self.journalWriter.updateIndexHeader(self.indexHeaders.items[begin - 1], &journalReader.reader);
-                try self.journalWriter.writeIndex(merged);
                 try self.journal.sync(io);
 
                 count = mergableIndices(self.indexHeaders, self.config.IndexBranchingFactor);
@@ -811,6 +848,21 @@ const IndexHeader = struct {
     count: u64,
     level: u32,
     next: u64,
+    mapped: PSharedMappedSlice,
+
+    fn clone(self: *IndexHeader) IndexHeader {
+        return .{
+            .offset = self.offset,
+            .count = self.count,
+            .level = self.level,
+            .next = self.level,
+            .mapped = self.mapped.ref(),
+        };
+    }
+
+    fn deinit(self: IndexHeader) void {
+        self.mapped.unref();
+    }
 };
 
 // level         chunk_count        data_size        index_size(in memory)
@@ -1193,6 +1245,7 @@ fn JournalReader(comptime io: std.Io) type {
     return struct {
         const Self = @This();
 
+        file: std.Io.File,
         reader: std.Io.File.Reader,
         alloc: std.mem.Allocator,
         buffer: []u8,
@@ -1201,6 +1254,7 @@ fn JournalReader(comptime io: std.Io) type {
             const buffer = try alloc.alloc(u8, 4096);
             const reader = file.reader(io, buffer);
             return .{
+                .file = file,
                 .reader = reader,
                 .alloc = alloc,
                 .buffer = buffer,
@@ -1275,11 +1329,13 @@ fn JournalReader(comptime io: std.Io) type {
             const toSkip = count * (Index.PrefixSize + Index.SuffixSize + ChunkRef.DiskSize) + @sizeOf(u32);
 
             try self.reader.seekBy(@intCast(toSkip));
+            const endOffset = self.reader.logicalPos();
             return .{
                 .offset = offset,
                 .count = count,
                 .level = level,
                 .next = next,
+                .mapped = try .init(self.alloc, self.file, offset, endOffset - offset),
             };
         }
 
@@ -1793,6 +1849,7 @@ test "index read/write" {
     var r = try JournalReader(io).init(alloc, journal);
     defer r.deinit();
     const idxHeader = try r.skipIndex();
+    defer idxHeader.deinit();
     try testing.expectEqual(refs.count(), idxHeader.count);
     try testing.expectEqual(0, idxHeader.level);
     try testing.expectEqual(0, idxHeader.next);

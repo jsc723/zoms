@@ -34,7 +34,7 @@ const MappedSlice = struct {
     }
 };
 
-const SharedMappedSlice = struct {
+pub const SharedMappedSlice = struct {
     shared: MappedSlice,
     rc: RefCount,
     alloc: std.mem.Allocator,
