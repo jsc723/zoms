@@ -4,12 +4,12 @@ cp zig-out/include/zjs.h noms/go/nbs/zjs/lib/
 
 
 rm -f ./codec-perf-rig && go build .
-rm -rf /tmp/test-nbs && ./codec-perf-rig --db nbs::/tmp/test-nbs
-rm -rf /tmp/test-zjs && ./codec-perf-rig --db zjs::/tmp/test-zjs
+rm -rf /tmp/test-nbs && ./codec-perf-rig --db nbs:/tmp/test-nbs
+rm -rf /tmp/test-zjs && ./codec-perf-rig --db zjs:/tmp/test-zjs
 
 === multi thread ===
 
-ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-zjs && ./codec-perf-rig --db zjs::/tmp/test-zjs
+ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-zjs && ./codec-perf-rig --db zjs:/tmp/test-zjs
 Codec perf: sepc=zjs::/tmp/test-zjs
 Testing List:           build 100000  scan 100000                     insert 100000
 numbers (8 B)           32 ms (24.43 MB/s)  18 ms (42.87 MB/s)              28 ms (28.49 MB/s)
@@ -29,7 +29,7 @@ structs (64 B)          1672 ms (3.83 MB/s)  71 ms (89.17 MB/s)              174
 Testing Blob:           build 33 MB  scan 33 MB
                         278 ms (120.43 MB/s)  65 ms (514.08 MB/s)
 
-ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-nbs && ./codec-perf-rig --db nbs::/tmp/test-nbs
+ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-nbs && ./codec-perf-rig --db nbs:/tmp/test-nbs
 Codec perf: sepc=nbs::/tmp/test-nbs
 Testing List:           build 100000  scan 100000                     insert 100000
 numbers (8 B)           23 ms (33.81 MB/s)  17 ms (45.77 MB/s)              27 ms (28.70 MB/s)
@@ -51,8 +51,7 @@ Testing Blob:           build 33 MB  scan 33 MB
 
 === single thread ===
 
-ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-nbs && GOMAXPROCS=1 ./codec-perf-rig 
---db nbs::/tmp/test-nbs
+ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-nbs && GOMAXPROCS=1 ./codec-perf-rig --db nbs:/tmp/test-nbs
 Codec perf: sepc=nbs::/tmp/test-nbs
 Testing List:           build 100000                    scan 100000                     insert 100000
 numbers (8 B)           27 ms (29.58 MB/s)              21 ms (36.97 MB/s)              34 ms (23.05 MB/s)
@@ -73,8 +72,7 @@ Testing Blob:           build 33 MB                     scan 33 MB
                         309 ms (108.42 MB/s)            56 ms (589.36 MB/s)
 
 
-ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-zjs && GOMAXPROCS=1 ./codec-perf-rig 
---db zjs::/tmp/test-zjs
+ubuntu24@jsc-legion:~/code/zoms/noms/go/perf/codec-perf-rig$ rm -rf /tmp/test-zjs && GOMAXPROCS=1 ./codec-perf-rig --db zjs:/tmp/test-zjs
 Codec perf: sepc=zjs::/tmp/test-zjs
 Testing List:           build 100000                    scan 100000                     insert 100000
 numbers (8 B)           24 ms (32.72 MB/s)              20 ms (39.11 MB/s)              34 ms (23.49 MB/s)
