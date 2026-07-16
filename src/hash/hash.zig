@@ -110,8 +110,8 @@ pub const Hash = struct {
         return s;
     }
 
-    pub fn suffixEqual(self: Hash, other: [12]u8) bool {
-        return std.mem.eql(u8, self.bytes[8..], &other);
+    pub fn suffixEqual(self: Hash, other: []const u8) bool {
+        return std.mem.eql(u8, self.bytes[8..], other[0..12]);
     }
 
     pub const Context = HashContext;

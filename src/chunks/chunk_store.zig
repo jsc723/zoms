@@ -392,8 +392,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                try r.seekTo(header.offset);
-                const maybeRef = try journalReader.searchInIndex(key);
+                const maybeRef = try header.search(key);
                 if (maybeRef) |ref| {
                     try r.seekTo(ref.offset);
                     const data = try r.interface.readAlloc(self.alloc, ref.size);
@@ -468,8 +467,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                try r.seekTo(header.offset);
-                const found = try journalReader.searchManyInIndex(remaining);
+                const found = try header.searchMany(self.alloc, remaining);
                 absent -= found;
                 if (absent == 0) {
                     break;
@@ -517,7 +515,6 @@ pub fn JournalStore(comptime io: std.Io) type {
         pub fn has(self: *Self, key: Hash) !bool {
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
-            var r = &journalReader.reader;
             var headers = std.ArrayList(IndexHeader).empty;
             defer {
                 for (headers.items) |*header| {
@@ -537,8 +534,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                try r.seekTo(header.offset);
-                const maybeRef = try journalReader.searchInIndex(key);
+                const maybeRef = try header.search(key);
                 if (maybeRef != null) {
                     return true;
                 }
@@ -551,7 +547,6 @@ pub fn JournalStore(comptime io: std.Io) type {
             defer remaining.deinit(self.alloc);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
-            var r = &journalReader.reader;
             var headers = std.ArrayList(IndexHeader).empty;
             defer {
                 for (headers.items) |*header| {
@@ -589,8 +584,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                try r.seekTo(header.offset);
-                const found = try journalReader.searchManyInIndex(remaining);
+                const found = try header.searchMany(self.alloc, remaining);
                 absent -= found;
                 if (absent == 0) {
                     return 0;
@@ -862,6 +856,193 @@ const IndexHeader = struct {
 
     fn deinit(self: IndexHeader) void {
         self.mapped.unref();
+    }
+
+    fn readAt(comptime T: type, data: []const u8, idx: usize) T {
+        const begin = @sizeOf(T) * idx;
+        const end = begin + @sizeOf(T);
+        return std.mem.readInt(T, data[begin..end][0..@sizeOf(T)], .big);
+    }
+
+    fn readAtOffset(comptime T: type, data: []const u8, begin: usize) T {
+        const end = begin + @sizeOf(T);
+        return std.mem.readInt(T, data[begin..end][0..@sizeOf(T)], .big);
+    }
+
+    fn search(index: IndexHeader, h: Hash) !?ChunkRef {
+        // just make sure mapped is not release while searching
+        _ = index.mapped.ref();
+        defer index.mapped.unref();
+
+        const mem = std.mem;
+        var data = index.mapped.data();
+        const recordType: JournalRecordType = @enumFromInt(data[0]);
+        if (recordType != .Index) {
+            return error.SearchIndexTypeMismatch;
+        }
+        const count = mem.readInt(u64, data[1..9], .big);
+        // now at start of prefix
+        const beginOfPrefix = 1 + @sizeOf(u64) + @sizeOf(u64) + 2 * @sizeOf(u32);
+        const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
+        const beginOfRefs = beginOfSuffix + Index.SuffixSize * count;
+        const endOfRefs = beginOfRefs + ChunkRef.DiskSize * count;
+        const prefixSlice = data[beginOfPrefix..beginOfSuffix];
+        const suffixSlice = data[beginOfSuffix..beginOfRefs];
+        const refSlice = data[beginOfRefs..endOfRefs];
+
+        const res = try lowerBound(prefixSlice, h.prefix(), 0, count);
+        if (res == count) {
+            return null; // prefix not found
+        }
+        const eqlCount = try countEql(prefixSlice, h.prefix(), res, count);
+
+        for (0..eqlCount) |k| {
+            const i_index = res + k;
+            const start = Index.SuffixSize * (i_index);
+            const end = Index.SuffixSize * (i_index + 1);
+            if (h.suffixEqual(suffixSlice[start..end])) {
+                const offset = readAtOffset(u64, refSlice, ChunkRef.DiskSize * i_index);
+                const size = readAtOffset(u32, refSlice, ChunkRef.DiskSize * i_index + @sizeOf(u64));
+                return ChunkRef{
+                    .offset = offset,
+                    .size = size,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn searchMany(index: IndexHeader, alloc: std.mem.Allocator, sortedUniqueHashes: std.ArrayList(HashRefPair)) !u64 {
+        // just make sure mapped is not release while searching
+        _ = index.mapped.ref();
+        defer index.mapped.unref();
+
+        const CheckRange = struct { i_index: u64, count: u64, i_input: u64 };
+        const CheckedIndex = struct { i_index: u64, i_input: u64 };
+        const mem = std.mem;
+        var data = index.mapped.data();
+        const recordType: JournalRecordType = @enumFromInt(data[0]);
+        if (recordType != .Index) {
+            return error.SearchIndexTypeMismatch;
+        }
+        const count = mem.readInt(u64, data[1..9], .big);
+        // now at start of prefix
+        const beginOfPrefix = 1 + @sizeOf(u64) + @sizeOf(u64) + 2 * @sizeOf(u32);
+        const beginOfSuffix = beginOfPrefix + Index.PrefixSize * count;
+        const beginOfRefs = beginOfSuffix + Index.SuffixSize * count;
+        const endOfRefs = beginOfRefs + ChunkRef.DiskSize * count;
+        const prefixSlice = data[beginOfPrefix..beginOfSuffix];
+        const suffixSlice = data[beginOfSuffix..beginOfRefs];
+        const refSlice = data[beginOfRefs..endOfRefs];
+
+        var suffixRangeToCheck = std.ArrayList(CheckRange).empty;
+        defer suffixRangeToCheck.deinit(alloc);
+        var i: u64 = 0;
+        for (0..sortedUniqueHashes.items.len) |i_input| {
+            if (sortedUniqueHashes.items[i_input].ref.isValid()) {
+                // already found from other index, skip
+                continue;
+            }
+            const h = sortedUniqueHashes.items[i_input].h;
+
+            const lub = try looseUpperBound(prefixSlice, h.prefix(), i, count);
+            const res = try lowerBound(prefixSlice, h.prefix(), lub.last, lub.up);
+            if (res == count) {
+                // there is no index who is >= currrent hash, therefore all hashes after this one can be skiped
+                break;
+            }
+            // res points at the first element >= h.prefix()
+            const eqCount = try countEql(prefixSlice, h.prefix(), res, count);
+            if (eqCount > 0) {
+                try suffixRangeToCheck.append(alloc, .{
+                    .i_index = res,
+                    .count = eqCount,
+                    .i_input = i_input,
+                });
+            }
+            i = res; // because res is the first place whose value >= current input hash prefix
+        }
+        // verify idxAtValidPrefixes in suffix
+        var idxAtValidSuffixes = try std.ArrayList(CheckedIndex).initCapacity(alloc, suffixRangeToCheck.items.len);
+        defer idxAtValidSuffixes.deinit(alloc);
+        for (suffixRangeToCheck.items) |cr| {
+            for (0..cr.count) |_| {
+                const start = Index.SuffixSize * cr.i_index;
+                const end = Index.SuffixSize * (cr.i_index + 1);
+
+                if (sortedUniqueHashes.items[cr.i_input].h.suffixEqual(suffixSlice[start..end])) {
+                    try idxAtValidSuffixes.append(alloc, .{
+                        .i_index = cr.i_index,
+                        .i_input = cr.i_input,
+                    });
+                    break;
+                }
+            }
+        }
+        for (idxAtValidSuffixes.items) |ci| {
+            const offset = readAtOffset(u64, refSlice, ChunkRef.DiskSize * ci.i_index);
+            const size = readAtOffset(u32, refSlice, ChunkRef.DiskSize * ci.i_index + @sizeOf(u64));
+            sortedUniqueHashes.items[ci.i_input].ref = ChunkRef{
+                .offset = offset,
+                .size = size,
+            };
+        }
+        return idxAtValidSuffixes.items.len;
+    }
+
+    // return some index whose element >= v
+    // if there is multiple valid results, it can return any of them,
+    // if not exist, return end and last (if not equal to end, then it is guarenteed that items[last] < v)
+    // do this in log(k-begin)
+    fn looseUpperBound(data: []const u8, v: u64, beginIndex: u64, endIndex: u64) !struct {
+        up: u64,
+        last: u64,
+    } {
+        var i = beginIndex;
+        var step: u64 = 1;
+        var last = i;
+        while (i < endIndex) {
+            const cur = readAt(u64, data, i);
+            if (cur >= v) {
+                return .{ .up = i, .last = last };
+            }
+            last = i; // cur < v
+            i += step;
+            step *= 2;
+        }
+        return .{ .up = endIndex, .last = last };
+    }
+
+    // return the first index whose value >= v, if not exist return end
+    fn lowerBound(data: []const u8, v: u64, beginIndex: u64, endIndex: u64) !u64 {
+        var i = beginIndex;
+        var j = endIndex;
+        while (j > i) {
+            const step = (j - i) / 2;
+            const cur = readAt(u64, data, i + step);
+            if (cur < v) {
+                i = i + step + 1;
+            } else {
+                j = i + step;
+            }
+        }
+        if (i == endIndex) {
+            return endIndex;
+        }
+        return i;
+    }
+
+    // start from startIdx, count num of elements that is equal to v until not equal or out of range
+    fn countEql(data: []const u8, v: u64, beginIndex: u64, endIndex: u64) !u64 {
+        var i = beginIndex;
+        while (i < endIndex) {
+            const u = readAt(u64, data, i);
+            if (u != v) {
+                break;
+            }
+            i += 1; // find an equal item, continue
+        }
+        return i - beginIndex;
     }
 };
 
@@ -1361,7 +1542,7 @@ fn JournalReader(comptime io: std.Io) type {
             var suffix: Index.Suffix = undefined;
             for (0..eqlCount) |_| {
                 try r.readSliceAll(&suffix);
-                if (h.suffixEqual(suffix)) {
+                if (h.suffixEqual(&suffix)) {
                     try self.reader.seekTo(beginOfRefs + ChunkRef.DiskSize * res);
                     const offset = try r.takeInt(u64, .big);
                     const size = try r.takeInt(u32, .big);
@@ -1425,7 +1606,7 @@ fn JournalReader(comptime io: std.Io) type {
                 try self.reader.seekTo(beginOfSuffix + Index.SuffixSize * cr.i_index);
                 for (0..cr.count) |_| {
                     try self.reader.interface.readSliceAll(&suffixBuf);
-                    if (sortedUniqueHashes.items[cr.i_input].h.suffixEqual(suffixBuf)) {
+                    if (sortedUniqueHashes.items[cr.i_input].h.suffixEqual(&suffixBuf)) {
                         try idxAtValidSuffixes.append(self.alloc, .{
                             .i_index = cr.i_index,
                             .i_input = cr.i_input,
