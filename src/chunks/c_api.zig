@@ -4,6 +4,10 @@ var threaded = std.Io.Threaded.init_single_threaded;
 const io = threaded.io();
 const Chunk = chunks.chunks.Chunk;
 const Hash = chunks.hash.Hash;
+pub const hash_iterator = @import("hash_iterator.zig");
+pub const HashIterator = hash_iterator.HashIterator;
+pub const ConstSliceIteraetor = hash_iterator.ConstSliceIterator;
+pub const CArrayHashIterator = hash_iterator.CArrayHashIterator;
 
 export fn journalStore_init(path: [*:0]const u8) ?*anyopaque {
     const alloc = std.heap.c_allocator;
@@ -89,12 +93,7 @@ export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]b
         return 0;
     }
     const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle.?));
-    var keyset = chunks.HashSet.init(std.heap.c_allocator);
-    defer keyset.deinit();
-    keyset.ensureTotalCapacity(@intCast(len)) catch {
-        std.debug.print("ZJS Error: failed to ensure capacity for keyset\n", .{});
-        return 0;
-    };
+
     var idxMap = std.AutoHashMap(Hash, u64).init(std.heap.c_allocator);
     defer idxMap.deinit();
     idxMap.ensureTotalCapacity(@intCast(len)) catch {
@@ -102,20 +101,14 @@ export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]b
         return 0;
     };
     for (0..len) |i| {
-        const pHash = keys.?[i].?;
-        const h = Hash.fromOther(pHash);
-        keyset.put(h, {}) catch {
-            std.debug.print("ZJS Error: keyset put failed\n", .{});
-            return 0;
-        };
-        idxMap.put(h, i) catch {
-            std.debug.print("ZJS Error: idxMap put failed\n", .{});
-            return 0;
-        };
-    }
-    for (0..len) |i| {
         out.?[i] = true;
     }
+    var keyIter = HashIterator{ .carray = CArrayHashIterator{
+        .ptr = keys,
+        .len = len,
+        .i = 0,
+        .cur = Hash.Empty,
+    } };
     const Context = struct {
         idxMap: *std.AutoHashMap(Hash, u64),
         out: [*]bool,
@@ -128,7 +121,7 @@ export fn journalStore_hasMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out: ?[*]b
         .idxMap = &idxMap,
         .out = out.?,
     };
-    const absent = store.hasMany(&keyset, &ctx) catch |e| {
+    const absent = store.hasMany(&keyIter, &ctx) catch |e| {
         std.debug.print("ZJS Error: hasMany failed {any}\n", .{e});
         return 0;
     };

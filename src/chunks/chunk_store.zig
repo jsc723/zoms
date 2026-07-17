@@ -12,6 +12,10 @@ const Hash = hash.Hash;
 pub const HashChunkMap = std.AutoHashMap(Hash, Chunk);
 pub const HashSet = Hash.Set;
 
+pub const hash_iterator = @import("hash_iterator.zig");
+pub const HashIterator = hash_iterator.HashIterator;
+pub const ConstSliceIteraetor = hash_iterator.ConstSliceIterator;
+const print = std.debug.print;
 pub fn ChunkStore(comptime io: std.Io) type {
     return union(enum) {
         const Self = @This();
@@ -25,7 +29,7 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn hasMany(self: Self, keys: *const HashSet, onAbsent: anytype) !u64 {
+        pub fn hasMany(self: Self, keys: *HashIterator, onAbsent: anytype) !u64 {
             return switch (self) {
                 inline else => |m| m.hasMany(keys, onAbsent),
             };
@@ -217,12 +221,11 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             return self.pending.contains(key) or try self.storage.has(key);
         }
 
-        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u64 {
+        pub fn hasMany(self: *Self, keys: *HashIterator, onAbsent: anytype) !u64 {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
             var absentCount: u64 = 0;
-            var iter = keys.keyIterator();
-            while (iter.next()) |pk| {
+            while (keys.next()) |pk| {
                 if (self.pending.contains(pk.*) or (try self.storage.has(pk.*))) {
                     continue;
                 }
@@ -310,12 +313,13 @@ pub fn JournalStore(comptime io: std.Io) type {
 
         pub fn init(alloc: std.mem.Allocator, journalPath: []const u8, config: Config) !Self {
             const journal = try openOrCreateFile(io, journalPath, .{ .allowWrite = true });
-            var writer = try JournalWriter(io).init(alloc, journal);
+            var writer = try JournalWriter(io).init(alloc, journal.file);
             errdefer writer.deinit();
-            if (try journal.length(io) == 0) {
+            if (journal.created) {
                 const placeholderIndex = Index.initHeader(alloc);
                 try writer.writeIndex(placeholderIndex);
                 try writer.flush();
+                try journal.file.sync(io);
             }
             var self = Self{
                 .pendingSize = 0,
@@ -324,7 +328,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .mu = std.Io.RwLock.init,
                 .alloc = alloc,
                 .config = config,
-                .journal = journal,
+                .journal = journal.file,
                 .journalWriter = writer,
                 .journaledChunks = .init(alloc),
                 .indexHeaders = .empty,
@@ -467,7 +471,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                const found = try header.searchMany(self.alloc, remaining);
+                const found = try header.searchMany(self.alloc, remaining.items);
                 absent -= found;
                 if (absent == 0) {
                     break;
@@ -542,7 +546,12 @@ pub fn JournalStore(comptime io: std.Io) type {
             return false;
         }
 
-        pub fn hasMany(self: *Self, keys: *const HashSet, onAbsent: anytype) !u64 {
+        pub fn hasMany(self: *Self, keys: *HashIterator, onAbsent: anytype) !u64 {
+            return self.hasManyInternal(keys, onAbsent, true, true);
+        }
+
+        // assume locked
+        fn hasManyInternal(self: *Self, keys: *HashIterator, onAbsent: anytype, comptime checkPending: bool, comptime acquireLock: bool) !u64 {
             var remaining = std.ArrayList(HashRefPair).empty;
             defer remaining.deinit(self.alloc);
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
@@ -555,12 +564,15 @@ pub fn JournalStore(comptime io: std.Io) type {
                 headers.deinit(self.alloc);
             }
             {
-                try self.mu.lock(io);
-                defer self.mu.unlock(io);
-                var iter = keys.keyIterator();
+                if (comptime acquireLock) {
+                    try self.mu.lock(io);
+                }
+                defer if (comptime acquireLock) {
+                    self.mu.unlock(io);
+                };
 
-                while (iter.next()) |pk| {
-                    if (self.pending.contains(pk.*) or self.journaledChunks.contains(pk.*)) {
+                while (keys.next()) |pk| {
+                    if ((checkPending and self.pending.contains(pk.*)) or self.journaledChunks.contains(pk.*)) {
                         continue;
                     }
                     try remaining.append(self.alloc, .{
@@ -572,6 +584,10 @@ pub fn JournalStore(comptime io: std.Io) type {
                     });
                 }
 
+                if (remaining.items.len == 0) {
+                    return 0;
+                }
+
                 headers = try self.headersCopy();
             }
             std.mem.sortUnstable(HashRefPair, remaining.items, {}, struct {
@@ -579,12 +595,13 @@ pub fn JournalStore(comptime io: std.Io) type {
                     return a.h.compare(b.h) == .lt;
                 }
             }.less);
+
             var i = headers.items.len;
             var absent: u64 = @intCast(remaining.items.len);
             while (i > 0) {
                 i -= 1;
                 const header = headers.items[i];
-                const found = try header.searchMany(self.alloc, remaining);
+                const found = try header.searchMany(self.alloc, remaining.items);
                 absent -= found;
                 if (absent == 0) {
                     return 0;
@@ -667,22 +684,25 @@ pub fn JournalStore(comptime io: std.Io) type {
         fn writePending(self: *Self) !void {
             // assume is locked
             // write chunks
-            const WriteChunkCallBack = struct {
-                store: *Self,
-                fn invoke(closure: *@This(), h: Hash, offset: u64, size: u32) !void {
-                    try closure.store.journaledChunks.put(h, .{
-                        .offset = offset,
-                        .size = size,
-                    });
+            var chunksWriter = try self.journalWriter.startWriteChunks();
+            var onAbsent = struct {
+                chunksWriter: *JournalWriter(io).ChunksWriter,
+                self: *Self,
+                fn invoke(ctx: *@This(), h: Hash) !void {
+                    if (ctx.self.pending.get(h)) |c| {
+                        const ref = try ctx.chunksWriter.write(c);
+                        try ctx.self.journaledChunks.put(c.h, ref);
+                    }
                 }
+            }{
+                .chunksWriter = &chunksWriter,
+                .self = self,
             };
-            var cb = WriteChunkCallBack{
-                .store = self,
+            var pendingIter = HashIterator{
+                .map = self.pending.keyIterator(),
             };
-
-            // TODO: filter pending with hasMany, also make hasMany accept an iterator as input
-
-            try self.journalWriter.writeChunksNoFlush(self.pending, &cb);
+            _ = try self.hasManyInternal(&pendingIter, &onAbsent, false, false);
+            try chunksWriter.finish();
             try self.journalWriter.writer.flush();
             self.clearPending();
 
@@ -721,8 +741,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 const toMerge = self.indexHeaders.items[begin..end];
                 const level = toMerge[0].level;
                 if (level > Index.MaxMergableLevelInMemory) {
-                    // TODO: should do an on-disk index merge, but leave that work to future for now.
-                    // currently, just do not continue to merge, so number of index at MaxMergableLevelInMemory will grow linearly from here.
+                    // TODO: Since we have mmap, we should be able to merge index relatively easily
                     break;
                 }
                 // in memory merging
@@ -914,7 +933,7 @@ const IndexHeader = struct {
         return null;
     }
 
-    fn searchMany(index: IndexHeader, alloc: std.mem.Allocator, sortedUniqueHashes: std.ArrayList(HashRefPair)) !u64 {
+    fn searchMany(index: IndexHeader, alloc: std.mem.Allocator, sortedHashes: []HashRefPair) !u64 {
         // just make sure mapped is not release while searching
         _ = index.mapped.ref();
         defer index.mapped.unref();
@@ -940,12 +959,12 @@ const IndexHeader = struct {
         var suffixRangeToCheck = std.ArrayList(CheckRange).empty;
         defer suffixRangeToCheck.deinit(alloc);
         var i: u64 = 0;
-        for (0..sortedUniqueHashes.items.len) |i_input| {
-            if (sortedUniqueHashes.items[i_input].ref.isValid()) {
+        for (0..sortedHashes.len) |i_input| {
+            if (sortedHashes[i_input].ref.isValid()) {
                 // already found from other index, skip
                 continue;
             }
-            const h = sortedUniqueHashes.items[i_input].h;
+            const h = sortedHashes[i_input].h;
 
             const lub = try looseUpperBound(prefixSlice, h.prefix(), i, count);
             const res = try lowerBound(prefixSlice, h.prefix(), lub.last, lub.up);
@@ -973,7 +992,7 @@ const IndexHeader = struct {
                 const start = Index.SuffixSize * i_index;
                 const end = Index.SuffixSize * (i_index + 1);
 
-                if (sortedUniqueHashes.items[cr.i_input].h.suffixEqual(suffixSlice[start..end])) {
+                if (sortedHashes[cr.i_input].h.suffixEqual(suffixSlice[start..end])) {
                     try idxAtValidSuffixes.append(alloc, .{
                         .i_index = i_index,
                         .i_input = cr.i_input,
@@ -985,7 +1004,7 @@ const IndexHeader = struct {
         for (idxAtValidSuffixes.items) |ci| {
             const offset = readAtOffset(u64, refSlice, ChunkRef.DiskSize * ci.i_index);
             const size = readAtOffset(u32, refSlice, ChunkRef.DiskSize * ci.i_index + @sizeOf(u64));
-            sortedUniqueHashes.items[ci.i_input].ref = ChunkRef{
+            sortedHashes[ci.i_input].ref = ChunkRef{
                 .offset = offset,
                 .size = size,
             };
@@ -1282,6 +1301,55 @@ fn JournalWriter(comptime io: std.Io) type {
             self.alloc.free(self.buffer);
         }
 
+        const ChunksWriter = struct {
+            w: *std.Io.File.Writer,
+            hasher: std.hash.Crc32,
+            lenPos: u64,
+            count: u32,
+
+            fn init(w: *std.Io.File.Writer) !ChunksWriter {
+                // type (1)
+                try w.interface.writeByte(@intFromEnum(JournalRecordType.Chunks));
+                const lenPos = w.logicalPos();
+                // number of chunks (4)
+                // write placeholder for count
+                try w.interface.writeInt(u32, 0, .big);
+                // write placeholder for verifyCount
+                try w.interface.writeInt(u32, 0, .big);
+                return .{
+                    .w = w,
+                    .hasher = std.hash.Crc32.init(),
+                    .lenPos = lenPos,
+                    .count = 0,
+                };
+            }
+
+            fn write(self: *ChunksWriter, c: Chunk) !ChunkRef {
+                try chunks.serialize(c, &self.w.interface);
+                const offset = self.w.logicalPos() - c.data.len;
+                const size: u32 = @intCast(c.data.len);
+                self.hasher.update(&c.h.bytes);
+                self.count += 1;
+                return .{
+                    .offset = offset,
+                    .size = size,
+                };
+            }
+
+            fn finish(self: *ChunksWriter) !void {
+                try self.w.interface.writeInt(u32, self.hasher.final(), .big);
+                const cur = self.w.logicalPos();
+                try self.w.seekTo(self.lenPos);
+                try self.w.interface.writeInt(u32, self.count, .big);
+                try self.w.interface.writeInt(u32, ~self.count, .big);
+                try self.w.seekTo(cur);
+            }
+        };
+
+        pub fn startWriteChunks(self: *Self) !ChunksWriter {
+            return try .init(&self.writer);
+        }
+
         pub fn writeChunksNoFlush(self: *Self, chunkSets: HashChunkMap, onChunkWritten: anytype) !void {
             var w = &self.writer.interface;
 
@@ -1290,7 +1358,9 @@ fn JournalWriter(comptime io: std.Io) type {
             // number of chunks (4)
             const chunkCount = chunkSets.count();
             try w.writeInt(u32, chunkCount, .big);
-            var hashAcc = Hash.ofNumber(u32, chunkCount);
+            // write ~chunkCount as a verification (4)
+            try w.writeInt(u32, ~chunkCount, .big);
+            var hasher = std.hash.Crc32.init();
             // chunks
             var it = chunkSets.iterator();
             while (it.next()) |entry| {
@@ -1298,10 +1368,10 @@ fn JournalWriter(comptime io: std.Io) type {
                 const offset = self.writer.logicalPos() - entry.value_ptr.data.len;
                 const size: u32 = @intCast(entry.value_ptr.data.len);
                 try onChunkWritten.invoke(entry.key_ptr.*, offset, size);
-                hashAcc = hashAcc.add(entry.key_ptr.*);
+                hasher.update(&entry.key_ptr.bytes);
             }
-            // hash(number of chunks, chunk1.hash, chunk2.hash, ...) (20)
-            try w.writeAll(&hashAcc.bytes);
+            // crc32 (4)
+            try w.writeInt(u32, hasher.final(), .big);
         }
 
         const WriterContext = struct {
@@ -1465,12 +1535,17 @@ fn JournalReader(comptime io: std.Io) type {
             }
             // number of chunks (4)
             const chunkCount = try r.takeInt(u32, .big);
-            var hashAcc = Hash.ofNumber(u32, chunkCount);
+            // read verifyCount which should equal to ~chunk
+            const verifyCount = try r.takeInt(u32, .big);
+            if (chunkCount != ~verifyCount) {
+                return error.ChunksCountCorrupted;
+            }
+            var hasher = std.hash.Crc32.init();
 
             for (0..chunkCount) |_| {
                 //hash
                 const h = try Hash.fromReader(r);
-                hashAcc = hashAcc.add(h);
+                hasher.update(&h.bytes);
                 //size
                 const chunkSize = try r.takeInt(u32, .big);
                 //data
@@ -1480,8 +1555,8 @@ fn JournalReader(comptime io: std.Io) type {
                     @panic("read chunk contract is violated");
                 }
             }
-            const readHashAcc = try Hash.fromReader(r);
-            if (!readHashAcc.equals(hashAcc)) {
+            const readCrc32 = try r.takeInt(u32, .big);
+            if (readCrc32 != hasher.final()) {
                 return error.ChunksCorrupted;
             }
         }
@@ -1601,9 +1676,14 @@ fn testChunkStore(comptime _: []const u8, store: ChunkStore(testing.io), alloc: 
         }
     }{ .pOnAbsentInvoked = &onAbsentInvoked };
 
-    const absentCount = try store.hasMany(&checkSet, &onAbsent);
-    try testing.expectEqual(1, absentCount);
-    try testing.expectEqual(1, onAbsentInvoked);
+    {
+        var keys = HashIterator{
+            .set = checkSet.keyIterator(),
+        };
+        const absentCount = try store.hasMany(&keys, &onAbsent);
+        try testing.expectEqual(1, absentCount);
+        try testing.expectEqual(1, onAbsentInvoked);
+    }
 
     // getMany
     var found = HashChunkMap.init(alloc);
@@ -1698,9 +1778,10 @@ test "test journal writer and reader" {
     Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
     const tmpJournalPath = "tmp/testJournalWriter/test.zjs";
     const journal = try openOrCreateFile(io, tmpJournalPath, .{ .allowWrite = true });
+    defer journal.file.close(io);
     defer Dir.cwd().deleteTree(io, "tmp/testJournalWriter") catch {};
 
-    var w = try JournalWriter(io).init(alloc, journal);
+    var w = try JournalWriter(io).init(alloc, journal.file);
     defer w.deinit();
 
     const datas = [_][]const u8{ "hello", "world", "data" };
@@ -1712,19 +1793,23 @@ test "test journal writer and reader" {
         }
         chunkSet.deinit();
     }
+
     for (datas) |data| {
         const c = try Chunk.init(alloc, data);
         try chunkSet.put(c.h, c);
     }
-    const NoopCB = struct {
-        fn invoke(_: *@This(), _: Hash, _: u64, _: u64) !void {}
-    };
-    var cb = NoopCB{};
-    try w.writeChunksNoFlush(chunkSet, &cb);
+
+    var cw = try w.startWriteChunks();
+    var iter = chunkSet.valueIterator();
+    while (iter.next()) |c| {
+        _ = try cw.write(c.*);
+    }
+    try cw.finish();
+
     try w.writeRootNoFlush(Hash.of("a"));
     try w.writer.flush();
 
-    var r = try JournalReader(io).init(alloc, journal);
+    var r = try JournalReader(io).init(alloc, journal.file);
     defer r.deinit();
 
     try r.reader.seekTo(0);
@@ -1749,13 +1834,13 @@ test "test journal writer and reader" {
 test "test journal store" {
     const io = testing.io;
     const alloc = testing.allocator;
+
     Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     const tmpJournalPath = "tmp/testJournalStore2/test.zjs";
     var store = try JournalStore(io).init(alloc, tmpJournalPath, .{});
     defer Dir.cwd().deleteTree(io, "tmp/testJournalStore2") catch {};
     defer store.deinit();
 
-    const datas = [_][]const u8{ "hello", "world", "data" };
     var chunkSet = HashChunkMap.init(alloc);
     defer {
         var it = chunkSet.valueIterator();
@@ -1764,6 +1849,8 @@ test "test journal store" {
         }
         chunkSet.deinit();
     }
+
+    const datas = [_][]const u8{ "hello", "world", "data" };
     for (datas) |data| {
         const c = try Chunk.init(alloc, data);
         try store.putMove(c);
@@ -1854,18 +1941,19 @@ test "index read/write" {
     Dir.cwd().deleteTree(io, "tmp/testIndexSerialize") catch {};
     const tmpJournalPath = "tmp/testIndexSerialize/test.zjs";
     const journal = try openOrCreateFile(io, tmpJournalPath, .{ .allowWrite = true });
+    defer journal.file.close(io);
     defer Dir.cwd().deleteTree(io, "tmp/testIndexSerialize") catch {};
-    var w = try JournalWriter(io).init(alloc, journal);
+    var w = try JournalWriter(io).init(alloc, journal.file);
     defer w.deinit();
     try w.writeIndex(idx);
     try w.flush();
-    var r_test = try JournalReader(io).init(alloc, journal);
+    var r_test = try JournalReader(io).init(alloc, journal.file);
     defer r_test.deinit();
     const readIdx = try r_test.readIndex();
     defer readIdx.deinit();
     try testing.expectEqualDeep(idx, readIdx);
 
-    var r = try JournalReader(io).init(alloc, journal);
+    var r = try JournalReader(io).init(alloc, journal.file);
     defer r.deinit();
     const idxHeader = try r.skipIndex();
     defer idxHeader.deinit();
@@ -1918,7 +2006,7 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
 
         try r.reader.seekTo(0);
-        const found = try header.searchMany(alloc, searchPairs);
+        const found = try header.searchMany(alloc, searchPairs.items);
         try testing.expectEqual(3, found); // only hNotExist is absent
         try testing.expectEqual(0, searchPairs.items[0].ref.offset);
         try testing.expectEqual(10, searchPairs.items[0].ref.size);
@@ -1938,7 +2026,7 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
 
-        const found = try header.searchMany(alloc, searchPairs);
+        const found = try header.searchMany(alloc, searchPairs.items);
         try testing.expectEqual(4, found); // only hNotExist is absent
         try testing.expectEqual(0, searchPairs.items[0].ref.offset);
         try testing.expectEqual(10, searchPairs.items[0].ref.size);
@@ -1958,26 +2046,28 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = h11, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = h21, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h21, .ref = ChunkRef.empty });
+        try searchPairs.append(alloc, .{ .h = h21, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = h22, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
         try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
 
         try r.reader.seekTo(0);
-        const found = try header.searchMany(alloc, searchPairs);
-        try testing.expectEqual(6, found); // only hNotExist is absent
+        const found = try header.searchMany(alloc, searchPairs.items);
+        try testing.expectEqual(8, found); // only hNotExist is absent
         for (0..2) |i| {
             try testing.expectEqual(0, searchPairs.items[i].ref.offset);
             try testing.expectEqual(10, searchPairs.items[i].ref.size);
         }
-        for (2..5) |i| {
+        for (2..7) |i| {
             try testing.expectEqual(10, searchPairs.items[i].ref.offset);
             try testing.expectEqual(20, searchPairs.items[i].ref.size);
         }
-        for (5..6) |i| {
+        for (7..8) |i| {
             try testing.expectEqual(30, searchPairs.items[i].ref.offset);
             try testing.expectEqual(30, searchPairs.items[i].ref.size);
         }
-        try testing.expect(!searchPairs.items[6].ref.isValid()); // hNotExist not found
+        try testing.expect(!searchPairs.items[8].ref.isValid()); // hNotExist not found
     }
 
     { // search for only non-existing hashes
@@ -1986,7 +2076,7 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = hNotExist, .ref = ChunkRef.empty });
 
         try r.reader.seekTo(0);
-        const found2 = try header.searchMany(alloc, searchPairs);
+        const found2 = try header.searchMany(alloc, searchPairs.items);
         try testing.expectEqual(0, found2);
         try testing.expect(!searchPairs.items[0].ref.isValid());
         try testing.expect(!searchPairs.items[1].ref.isValid());
@@ -1999,7 +2089,7 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef.empty });
 
         try r.reader.seekTo(0);
-        const found3 = try header.searchMany(alloc, searchPairs);
+        const found3 = try header.searchMany(alloc, searchPairs.items);
         try testing.expectEqual(2, found3);
         try testing.expectEqual(0, searchPairs.items[0].ref.offset);
         try testing.expectEqual(10, searchPairs.items[0].ref.size);
@@ -2016,7 +2106,7 @@ test "index read/write" {
         try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef{ .offset = 30, .size = 30 } }); // already valid
 
         try r.reader.seekTo(0);
-        const found4 = try header.searchMany(alloc, searchPairs);
+        const found4 = try header.searchMany(alloc, searchPairs.items);
         try testing.expectEqual(1, found4); // h2 should be found
         try testing.expectEqual(10, searchPairs.items[1].ref.offset); // h2 found
         try testing.expectEqual(20, searchPairs.items[1].ref.size);
@@ -2085,13 +2175,13 @@ test "test everything in JournalStore" {
         cs.deinit();
     }
 
-    Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
-    const tmpJournalPath = "tmp/testJournalStoreAll/test.zjs";
-    var store = try JournalStore(io).init(alloc, tmpJournalPath, .{
+    Dir.cwd().deleteTree(io, "aaa/testJournalStoreAll") catch {};
+    defer Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
+    const testJournalAllPath = "tmp/testJournalStoreAll/test.zjs";
+    var store = try JournalStore(io).init(alloc, testJournalAllPath, .{
         .MaxPendingChunks = 25,
         .MaxJournaledChunksCount = 100,
     });
-    defer Dir.cwd().deleteTree(io, "tmp/testJournalStoreAll") catch {};
     defer store.deinit();
 
     var i: u64 = 0;
@@ -2180,7 +2270,10 @@ test "test everything in JournalStore" {
             }
         }{ .pCount = &absentInvoked, .pHashes = &absentHashes };
 
-        const absentCount = try store.hasMany(&checkSet, &onAbsent);
+        var keys = HashIterator{
+            .set = checkSet.keyIterator(),
+        };
+        const absentCount = try store.hasMany(&keys, &onAbsent);
         try testing.expectEqual(2, absentCount);
         try testing.expectEqual(2, absentInvoked);
         try testing.expect(absentHashes.contains(NotExist));
@@ -2316,11 +2409,11 @@ test "test everything in JournalStore" {
         try testing.expectEqual(50, foundChunks.count());
     }
 
-    _ = try store.commit(Hash.of("v2"), try store.root());
+    try testing.expect(try store.commit(Hash.of("v2"), try store.root()));
 
     {
         // test rebase from a store with multi level of index
-        var store2 = try JournalStore(io).init(alloc, tmpJournalPath, .{
+        var store2 = try JournalStore(io).init(alloc, testJournalAllPath, .{
             .MaxPendingChunks = 25,
             .MaxJournaledChunksCount = 100,
         });

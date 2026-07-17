@@ -6,11 +6,17 @@ const OpenCreateOptions = struct {
     allowWrite: bool = true,
 };
 
-pub fn openOrCreateFile(io: std.Io, path: []const u8, options: OpenCreateOptions) !File {
+pub fn openOrCreateFile(io: std.Io, path: []const u8, options: OpenCreateOptions) !struct {
+    file: File,
+    created: bool,
+} {
     if (Dir.cwd().openFile(io, path, .{
         .mode = if (options.allowWrite) .read_write else .read_only,
     })) |f| {
-        return f;
+        return .{
+            .file = f,
+            .created = false,
+        };
     } else |err| switch (err) {
         error.FileNotFound => {
             if (!options.allowWrite) {
@@ -19,9 +25,13 @@ pub fn openOrCreateFile(io: std.Io, path: []const u8, options: OpenCreateOptions
             if (Dir.path.dirname(path)) |parentDir| {
                 try Dir.cwd().createDirPath(io, parentDir);
             }
-            return try Dir.cwd().createFile(io, path, .{
+            const f = try Dir.cwd().createFile(io, path, .{
                 .read = true,
             });
+            return .{
+                .file = f,
+                .created = true,
+            };
         },
         else => {
             return err;
@@ -32,7 +42,8 @@ pub fn openOrCreateFile(io: std.Io, path: []const u8, options: OpenCreateOptions
 const testing = std.testing;
 test "test openOrCreateFile" {
     const io = testing.io;
-    const f = try openOrCreateFile(io, "tmp/testUtilFile/test.zjs", .{ .allowWrite = true });
+    const res = try openOrCreateFile(io, "tmp/testUtilFile/test.zjs", .{ .allowWrite = true });
+    try testing.expect(res.created);
     defer Dir.cwd().deleteTree(io, "tmp/testUtilFile") catch {};
-    defer f.close(io);
+    defer res.file.close(io);
 }

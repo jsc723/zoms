@@ -77,7 +77,9 @@ test "mmap" {
     const alloc = testing.allocator;
     const tmpFileName = "tmp/testMmap";
     Dir.cwd().deleteTree(io, tmpFileName) catch {};
-    const file: std.Io.File = try openOrCreateFile(io, tmpFileName, .{ .allowWrite = true });
+    defer Dir.cwd().deleteTree(io, tmpFileName) catch {};
+    const f = try openOrCreateFile(io, tmpFileName, .{ .allowWrite = true });
+    const file = f.file;
     defer file.close(io);
 
     const buffer = try alloc.alloc(u8, 4096);
