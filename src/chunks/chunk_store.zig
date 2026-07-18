@@ -150,9 +150,7 @@ pub fn MemoryStorage(comptime io: std.Io) type {
             while (it.next()) |entry| {
                 const k = entry.key_ptr.*;
                 const v = entry.value_ptr.*;
-                self.data.put(k, v) catch |err| {
-                    std.debug.panic("failed to insert chunk {any}", .{err});
-                };
+                try self.data.put(k, v);
             }
             return true;
         }
