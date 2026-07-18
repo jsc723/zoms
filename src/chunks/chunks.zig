@@ -294,3 +294,48 @@ test "test deserializer hash mismatch" {
     var deserializer = ChunkDeserializer.init(alc, &reader);
     try testing.expectError(error.HashMismatch, deserializer.next());
 }
+
+const lz4 = @import("lz4");
+test "lz4 compression" {
+    const allocator = std.testing.allocator;
+
+    // 1. Prepare compressible raw test data
+    const raw_data = "ZJS Engine Test! " ** 20; // Generates 340 bytes of repetitive text
+
+    // 2. Calculate the worst-case maximum size required for LZ4 compression
+    const max_compressed_size: usize = @intCast(lz4.LZ4_compressBound(@intCast(raw_data.len)));
+
+    // 3. Allocate the compression buffer
+    const compressed_buf = try allocator.alloc(u8, max_compressed_size);
+    defer allocator.free(compressed_buf);
+
+    // 4. Call the compression interface
+    const compressed_size = lz4.LZ4_compress_default(
+        @ptrCast(raw_data.ptr),
+        @ptrCast(compressed_buf.ptr),
+        @intCast(raw_data.len),
+        @intCast(max_compressed_size),
+    );
+
+    // Verify that compression succeeded (return value should be greater than 0)
+    try std.testing.expect(compressed_size > 0);
+    const final_compressed_slice = compressed_buf[0..@as(usize, @intCast(compressed_size))];
+
+    // 5. Allocate the decompression buffer (in production, raw_data.len will be retrieved from the Index)
+    const decompressed_buf = try allocator.alloc(u8, raw_data.len);
+    defer allocator.free(decompressed_buf);
+
+    // 6. Call the decompression interface (LZ4_decompress_safe is the recommended safe variant)
+    const decompress_result = lz4.LZ4_decompress_safe(
+        @ptrCast(final_compressed_slice.ptr),
+        @ptrCast(decompressed_buf.ptr),
+        @intCast(final_compressed_slice.len),
+        @intCast(raw_data.len),
+    );
+
+    // Verify that the decompressed size matches the original length exactly
+    try std.testing.expectEqual(@as(i32, @intCast(raw_data.len)), decompress_result);
+
+    // 7. Ultimate verification: ensure raw data and decompressed data are identical
+    try std.testing.expectEqualSlices(u8, raw_data, decompressed_buf);
+}

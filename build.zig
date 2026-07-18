@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const lz4_translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("libs/lz4/lz4.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lz4 = lz4_translate_c.createModule();
+
     const hash_mod = b.addModule("hash", .{
         .root_source_file = b.path("src/hash/MOD.zig"),
         .target = target,
@@ -27,8 +34,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "hash", .module = hash_mod },
             .{ .name = "util", .module = util_mod },
+            .{ .name = "lz4", .module = lz4 },
         },
     });
+    chunks_mod.addCSourceFiles(.{
+        .files = &.{"libs/lz4/lz4.c"},
+        .flags = &.{},
+    });
+
     const zjs_lib = b.addLibrary(.{
         .name = "zjs",
         .root_module = b.createModule(.{
@@ -38,10 +51,15 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "hash", .module = hash_mod },
                 .{ .name = "util", .module = util_mod },
+                .{ .name = "lz4", .module = lz4 },
             },
             .link_libc = true,
         }),
         .linkage = .static,
+    });
+    zjs_lib.root_module.addCSourceFiles(.{
+        .files = &.{"libs/lz4/lz4.c"},
+        .flags = &.{},
     });
     b.installArtifact(zjs_lib);
     const install_header = b.addInstallHeaderFile(b.path("src/chunks/zjs.h"), "zjs.h");
@@ -102,8 +120,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "hash", .module = hash_mod },
             .{ .name = "util", .module = util_mod },
+            .{ .name = "lz4", .module = lz4 },
         },
     });
+    chunks_test_mod.addCSourceFiles(.{
+        .files = &.{"libs/lz4/lz4.c"},
+        .flags = &.{},
+    });
+
     const chunks_tests = b.addTest(.{
         .root_module = chunks_test_mod,
     });
