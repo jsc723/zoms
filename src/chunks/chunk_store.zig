@@ -41,7 +41,7 @@ pub fn ChunkStore(comptime io: std.Io) type {
             };
         }
 
-        pub fn getMany(self: Self, keys: *const HashSet, onFound: anytype) !void {
+        pub fn getMany(self: Self, keys: *HashIterator, onFound: anytype) !void {
             return switch (self) {
                 inline else => |m| m.getMany(keys, onFound),
             };
@@ -199,12 +199,11 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
             return null;
         }
 
-        pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
+        pub fn getMany(self: *Self, keys: *HashIterator, onFound: anytype) !void {
             try self.mu.lockShared(io);
             defer self.mu.unlockShared(io);
 
-            var iter = keys.keyIterator();
-            while (iter.next()) |pk| {
+            while (keys.next()) |pk| {
                 var chunk = self.pending.get(pk.*);
                 if (chunk == null) {
                     chunk = try self.storage.get(pk.*);
@@ -406,7 +405,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             return null;
         }
 
-        pub fn getMany(self: *Self, keys: *const HashSet, onFound: anytype) !void {
+        pub fn getMany(self: *Self, keys: *HashIterator, onFound: anytype) !void {
             self.getManyCalled += 1;
             const t0 = std.Io.Timestamp.now(io, .real);
             defer {
@@ -434,8 +433,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 try self.mu.lock(io);
                 defer self.mu.unlock(io);
 
-                var iter = keys.keyIterator();
-                while (iter.next()) |pk| {
+                while (keys.next()) |pk| {
                     if (self.pending.get(pk.*)) |foundChunk| {
                         try onFound.invoke(try Chunk.initWithHash(self.alloc, foundChunk.data, pk.*));
                     } else if (self.journaledChunks.get(pk.*)) |ref| {
@@ -1700,7 +1698,12 @@ fn testChunkStore(comptime _: []const u8, store: ChunkStore(testing.io), alloc: 
             try self.found.put(chunk.getHash(), chunk);
         }
     }{ .found = &found };
-    try store.getMany(&checkSet, &onFound);
+    {
+        var iter = HashIterator{
+            .set = checkSet.keyIterator(),
+        };
+        try store.getMany(&iter, &onFound);
+    }
     try testing.expectEqual(3, found.count());
     try testing.expect(found.contains(Hash.of("data")));
     try testing.expect(found.contains(Hash.of("world")));
@@ -1726,7 +1729,12 @@ fn testChunkStore(comptime _: []const u8, store: ChunkStore(testing.io), alloc: 
             try self.found.put(chunk.getHash(), chunk);
         }
     }{ .found = &found2 };
-    try store.getMany(&checkSet, &onFound2);
+    {
+        var iter = HashIterator{
+            .set = checkSet.keyIterator(),
+        };
+        try store.getMany(&iter, &onFound2);
+    }
     try testing.expectEqual(3, found.count());
     try testing.expect(found.contains(Hash.of("data")));
     try testing.expect(found.contains(Hash.of("world")));
@@ -2157,7 +2165,10 @@ test "test JournalStore commit then getMany" {
         }
     }{ .pFound = &foundChunks };
 
-    try store.getMany(&checkSet, &onFound);
+    var iter = HashIterator{
+        .set = checkSet.keyIterator(),
+    };
+    try store.getMany(&iter, &onFound);
 }
 
 // a test that will trigger auto pending flush and index write.
@@ -2300,7 +2311,12 @@ test "test everything in JournalStore" {
             }
         }{ .pFound = &foundChunks };
 
-        try store.getMany(&checkSet, &onFound);
+        {
+            var it = HashIterator{
+                .set = checkSet.keyIterator(),
+            };
+            try store.getMany(&it, &onFound);
+        }
 
         const tGetManyEnd = std.Io.Timestamp.now(io, .real);
         std.debug.print("[perf] getMany: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});
@@ -2342,7 +2358,12 @@ test "test everything in JournalStore" {
 
         const tGetManyStart = std.Io.Timestamp.now(io, .real);
 
-        try store.getMany(&allHashes, &onFound);
+        {
+            var it = HashIterator{
+                .set = allHashes.keyIterator(),
+            };
+            try store.getMany(&it, &onFound);
+        }
 
         const tGetManyEnd = std.Io.Timestamp.now(io, .real);
         std.debug.print("[perf] getMany all: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});
@@ -2374,7 +2395,12 @@ test "test everything in JournalStore" {
                 try self.pFound.put(chunk.getHash(), chunk);
             }
         }{ .pFound = &foundChunks };
-        try store.getMany(&emptySet, &onFound2);
+        {
+            var it = HashIterator{
+                .set = emptySet.keyIterator(),
+            };
+            try store.getMany(&it, &onFound2);
+        }
         try testing.expectEqual(0, foundChunks.count());
     }
 
@@ -2405,7 +2431,12 @@ test "test everything in JournalStore" {
                 try self.pFound.put(chunk.getHash(), chunk);
             }
         }{ .pFound = &foundChunks };
-        try store.getMany(&mixSet, &onFound3);
+        {
+            var it = HashIterator{
+                .set = mixSet.keyIterator(),
+            };
+            try store.getMany(&it, &onFound3);
+        }
         try testing.expectEqual(50, foundChunks.count());
     }
 
@@ -2438,7 +2469,12 @@ test "test everything in JournalStore" {
             }
         }{ .pFound = &foundChunks };
 
-        try store2.getMany(&checkSet, &onFound);
+        {
+            var it = HashIterator{
+                .set = checkSet.keyIterator(),
+            };
+            try store2.getMany(&it, &onFound);
+        }
 
         const tGetManyEnd = std.Io.Timestamp.now(io, .real);
         std.debug.print("[perf] getMany: {d}ms\n", .{tGetManyStart.durationTo(tGetManyEnd).toMilliseconds()});

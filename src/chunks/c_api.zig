@@ -153,12 +153,6 @@ export fn journalStore_getMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out_slices
         return;
     }
     const store: *chunks.JournalStore(io) = @ptrCast(@alignCast(handle.?));
-    var keyset = chunks.HashSet.init(std.heap.c_allocator);
-    defer keyset.deinit();
-    keyset.ensureTotalCapacity(@intCast(len)) catch {
-        std.debug.print("ZJS Error: failed to ensure capacity for keyset\n", .{});
-        return;
-    };
     var idxMap = std.AutoHashMap(Hash, u64).init(std.heap.c_allocator);
     defer idxMap.deinit();
     idxMap.ensureTotalCapacity(@intCast(len)) catch {
@@ -168,10 +162,6 @@ export fn journalStore_getMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out_slices
     for (0..len) |i| {
         const pHash = keys.?[i].?;
         const h = Hash.fromOther(pHash);
-        keyset.put(h, {}) catch {
-            std.debug.print("ZJS Error: keyset put failed\n", .{});
-            return;
-        };
         idxMap.put(h, i) catch {
             std.debug.print("ZJS Error: idxMap put failed\n", .{});
             return;
@@ -192,7 +182,13 @@ export fn journalStore_getMany(handle: ?*anyopaque, keys: ?[*]?[*]u8, out_slices
         .idxMap = &idxMap,
         .out_slices = out_slices.?,
     };
-    store.getMany(&keyset, &ctx) catch |e| {
+    var keyIter = HashIterator{ .carray = CArrayHashIterator{
+        .ptr = keys,
+        .len = len,
+        .i = 0,
+        .cur = Hash.Empty,
+    } };
+    store.getMany(&keyIter, &ctx) catch |e| {
         std.debug.print("ZJS Error: getMany failed: {any}\n", .{e});
         return;
     };

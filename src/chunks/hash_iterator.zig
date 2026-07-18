@@ -11,11 +11,16 @@ pub const HashIterator = union(enum) {
     set: HashSet.KeyIterator,
     slice: ConstSliceIterator(Hash),
     carray: CArrayHashIterator,
+    custom: struct {
+        ptr: *anyopaque,
+        nextFn: *const fn (*anyopaque) ?*const Hash,
+    },
 
     const Self = @This();
 
     pub fn next(self: *Self) ?*const Hash {
         switch (self.*) {
+            .custom => |c| return c.nextFn(c.ptr),
             inline else => |*iter| return iter.next(),
         }
     }
