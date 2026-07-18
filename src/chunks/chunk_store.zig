@@ -888,7 +888,7 @@ const IndexHeader = struct {
             .offset = self.offset,
             .count = self.count,
             .level = self.level,
-            .next = self.level,
+            .next = self.next,
             .mapped = self.mapped.ref(),
         };
     }
