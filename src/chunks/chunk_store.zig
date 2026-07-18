@@ -272,10 +272,32 @@ pub fn MemoryStorageView(comptime io: std.Io) type {
 }
 
 const ChunkRef = struct {
-    const DiskSize = @sizeOf(u64) + @sizeOf(u32);
-    const empty = ChunkRef{ .offset = 0, .size = 0 };
+    const DiskSize = @sizeOf(u64) + 2 * @sizeOf(u32);
+    const empty = ChunkRef{
+        .offset = 0,
+        .size = 0,
+        .rawSize = 0,
+    };
     offset: u64,
-    size: u32,
+    size: u32, // compressed size on disk
+    rawSize: u32,
+
+    pub fn readFrom(reader: anytype) !ChunkRef {
+        const offset = try reader.takeInt(u64, .big);
+        const size = try reader.takeInt(u32, .big);
+        const rawSize = try reader.takeInt(u32, .big);
+        return .{
+            .offset = offset,
+            .size = size,
+            .rawSize = rawSize,
+        };
+    }
+
+    pub fn writeTo(self: ChunkRef, writer: anytype) !void {
+        try writer.writeInt(u64, self.offset, .big);
+        try writer.writeInt(u32, self.size, .big);
+        try writer.writeInt(u32, self.rawSize, .big);
+    }
 
     pub fn isValid(self: ChunkRef) bool {
         return self.size > 0;
@@ -371,6 +393,8 @@ pub fn JournalStore(comptime io: std.Io) type {
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
+            var chunkDeserializer = chunks.ChunkDeserializer.init(self.alloc);
+            defer chunkDeserializer.deinit();
             var headers = std.ArrayList(IndexHeader).empty;
             defer {
                 for (headers.items) |*header| {
@@ -384,10 +408,9 @@ pub fn JournalStore(comptime io: std.Io) type {
                 if (self.pending.get(key)) |val| {
                     return try Chunk.init(self.alloc, val.data);
                 }
-                if (self.journaledChunks.get(key)) |info| {
-                    try r.seekTo(info.offset);
-                    const data = try r.interface.readAlloc(self.alloc, info.size);
-                    return Chunk.moveInit(data);
+                if (self.journaledChunks.get(key)) |ref| {
+                    try r.seekTo(ref.offset);
+                    return try chunkDeserializer.deserializeData(&r.interface, ref.size, ref.rawSize);
                 }
                 headers = try self.headersCopy();
             }
@@ -398,8 +421,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                 const maybeRef = try header.search(key);
                 if (maybeRef) |ref| {
                     try r.seekTo(ref.offset);
-                    const data = try r.interface.readAlloc(self.alloc, ref.size);
-                    return Chunk.moveInit(data);
+                    return try chunkDeserializer.deserializeData(&r.interface, ref.size, ref.rawSize);
                 }
             }
             return null;
@@ -429,6 +451,8 @@ pub fn JournalStore(comptime io: std.Io) type {
             var journalReader = try JournalReader(io).init(self.alloc, self.journal);
             defer journalReader.deinit();
             var r = &journalReader.reader;
+            var ds = chunks.ChunkDeserializer.init(self.alloc);
+            defer ds.deinit();
             {
                 try self.mu.lock(io);
                 defer self.mu.unlock(io);
@@ -444,10 +468,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                     } else {
                         try remaining.append(self.alloc, .{
                             .h = pk.*,
-                            .ref = ChunkRef{
-                                .offset = 0,
-                                .size = 0,
-                            },
+                            .ref = ChunkRef.empty,
                         });
                     }
                 }
@@ -495,22 +516,22 @@ pub fn JournalStore(comptime io: std.Io) type {
                     continue;
                 }
                 try r.seekTo(toFetch.offset);
-                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
-                try onFound.invoke(Chunk.moveInit(data));
+                const c = try ds.deserializeData(&r.interface, toFetch.size, toFetch.rawSize);
+                try onFound.invoke(c);
             }
             while (i < journaledRefs.items.len) : (i += 1) {
                 const toFetch = journaledRefs.items[i].ref;
                 if (!toFetch.isValid()) continue;
                 try r.seekTo(toFetch.offset);
-                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
-                try onFound.invoke(Chunk.moveInit(data));
+                const c = try ds.deserializeData(&r.interface, toFetch.size, toFetch.rawSize);
+                try onFound.invoke(c);
             }
             while (j < remaining.items.len) : (j += 1) {
                 const toFetch = remaining.items[j].ref;
                 if (!toFetch.isValid()) continue;
                 try r.seekTo(toFetch.offset);
-                const data = try r.interface.readAlloc(self.alloc, toFetch.size);
-                try onFound.invoke(Chunk.moveInit(data));
+                const c = try ds.deserializeData(&r.interface, toFetch.size, toFetch.rawSize);
+                try onFound.invoke(c);
             }
         }
 
@@ -575,10 +596,7 @@ pub fn JournalStore(comptime io: std.Io) type {
                     }
                     try remaining.append(self.alloc, .{
                         .h = pk.*,
-                        .ref = ChunkRef{
-                            .offset = 0,
-                            .size = 0,
-                        },
+                        .ref = ChunkRef.empty,
                     });
                 }
 
@@ -639,15 +657,16 @@ pub fn JournalStore(comptime io: std.Io) type {
                 .Chunks => {
                     const RebaseChunksConsumer = struct {
                         store: *JournalStore(io),
-                        fn invoke(closure: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
+                        fn invoke(closure: *@This(), h: Hash, compressedSize: u32, rawSize: u32, fileReader: *std.Io.File.Reader) !void {
                             const res = try closure.store.journaledChunks.getOrPut(h);
                             if (!res.found_existing) {
                                 res.value_ptr.* = ChunkRef{
                                     .offset = fileReader.logicalPos(),
-                                    .size = chunkSize,
+                                    .size = compressedSize,
+                                    .rawSize = rawSize,
                                 };
                             }
-                            try fileReader.seekBy(chunkSize);
+                            try fileReader.seekBy(compressedSize);
                         }
                     };
                     var consumer = RebaseChunksConsumer{
@@ -683,6 +702,7 @@ pub fn JournalStore(comptime io: std.Io) type {
             // assume is locked
             // write chunks
             var chunksWriter = try self.journalWriter.startWriteChunks();
+            defer chunksWriter.deinit();
             var onAbsent = struct {
                 chunksWriter: *JournalWriter(io).ChunksWriter,
                 self: *Self,
@@ -921,10 +941,12 @@ const IndexHeader = struct {
             const end = Index.SuffixSize * (i_index + 1);
             if (h.suffixEqual(suffixSlice[start..end])) {
                 const offset = readAtOffset(u64, refSlice, ChunkRef.DiskSize * i_index);
-                const size = readAtOffset(u32, refSlice, ChunkRef.DiskSize * i_index + @sizeOf(u64));
+                const compressedSize = readAtOffset(u32, refSlice, ChunkRef.DiskSize * i_index + @sizeOf(u64));
+                const rawSize = readAtOffset(u32, refSlice, ChunkRef.DiskSize * i_index + @sizeOf(u64) + @sizeOf(u32));
                 return ChunkRef{
                     .offset = offset,
-                    .size = size,
+                    .size = compressedSize,
+                    .rawSize = rawSize,
                 };
             }
         }
@@ -1001,10 +1023,12 @@ const IndexHeader = struct {
         }
         for (idxAtValidSuffixes.items) |ci| {
             const offset = readAtOffset(u64, refSlice, ChunkRef.DiskSize * ci.i_index);
-            const size = readAtOffset(u32, refSlice, ChunkRef.DiskSize * ci.i_index + @sizeOf(u64));
+            const compressedSize = readAtOffset(u32, refSlice, ChunkRef.DiskSize * ci.i_index + @sizeOf(u64));
+            const rawSize = readAtOffset(u32, refSlice, ChunkRef.DiskSize * ci.i_index + @sizeOf(u64) + @sizeOf(u32));
             sortedHashes[ci.i_input].ref = ChunkRef{
                 .offset = offset,
-                .size = size,
+                .size = compressedSize,
+                .rawSize = rawSize,
             };
         }
         return idxAtValidSuffixes.items.len;
@@ -1166,11 +1190,11 @@ const Index = struct {
                 ctx.hasher.update(&[_]u8{byte});
                 return byte;
             }
-            fn takeInt(ctx: *@This(), comptime T: type) !T {
+            fn takeInt(ctx: *@This(), comptime T: type, endian: std.builtin.Endian) !T {
                 var buf: [@sizeOf(T)]u8 = undefined;
                 try ctx.br.readSliceAll(&buf);
                 ctx.hasher.update(&buf);
-                return std.mem.readInt(T, &buf, .big);
+                return std.mem.readInt(T, &buf, endian);
             }
         };
         var r = ReaderContext{ .br = reader, .hasher = &hasher };
@@ -1181,11 +1205,11 @@ const Index = struct {
             return error.ReadIndexTypeMismatch;
         }
         // count
-        const count = try r.takeInt(u64);
+        const count = try r.takeInt(u64, .big);
         // level
-        const level = try r.takeInt(u32);
+        const level = try r.takeInt(u32, .big);
         // next
-        const next = try r.takeInt(u64);
+        const next = try r.takeInt(u64, .big);
         // header_crc
         const header_crc = hasher.final();
         const read_header_crc = try reader.takeInt(u32, .big);
@@ -1203,7 +1227,7 @@ const Index = struct {
         // prefix
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            prefixs[i] = try r.takeInt(u64);
+            prefixs[i] = try r.takeInt(u64, .big);
         }
         // suffix
         i = 0;
@@ -1213,12 +1237,7 @@ const Index = struct {
         // refs
         i = 0;
         while (i < count) : (i += 1) {
-            const offset = try r.takeInt(u64);
-            const size = try r.takeInt(u32);
-            refs[i] = .{
-                .offset = offset,
-                .size = size,
-            };
+            refs[i] = try .readFrom(&r);
         }
         const crc32 = hasher.final();
         const readCrc32 = try reader.takeInt(u32, .big);
@@ -1301,11 +1320,12 @@ fn JournalWriter(comptime io: std.Io) type {
 
         const ChunksWriter = struct {
             w: *std.Io.File.Writer,
+            srz: chunks.ChunkSerializer,
             hasher: std.hash.Crc32,
             lenPos: u64,
             count: u32,
 
-            fn init(w: *std.Io.File.Writer) !ChunksWriter {
+            fn init(w: *std.Io.File.Writer, alloc: std.mem.Allocator) !ChunksWriter {
                 // type (1)
                 try w.interface.writeByte(@intFromEnum(JournalRecordType.Chunks));
                 const lenPos = w.logicalPos();
@@ -1316,21 +1336,27 @@ fn JournalWriter(comptime io: std.Io) type {
                 try w.interface.writeInt(u32, 0, .big);
                 return .{
                     .w = w,
+                    .srz = .init(alloc),
                     .hasher = std.hash.Crc32.init(),
                     .lenPos = lenPos,
                     .count = 0,
                 };
             }
 
+            fn deinit(self: *@This()) void {
+                self.srz.deinit();
+            }
+
             fn write(self: *ChunksWriter, c: Chunk) !ChunkRef {
-                try chunks.serialize(c, &self.w.interface);
-                const offset = self.w.logicalPos() - c.data.len;
+                const compressedSize = try self.srz.serialize(c, &self.w.interface);
+                const offset = self.w.logicalPos() - compressedSize;
                 const size: u32 = @intCast(c.data.len);
                 self.hasher.update(&c.h.bytes);
                 self.count += 1;
                 return .{
                     .offset = offset,
-                    .size = size,
+                    .size = compressedSize,
+                    .rawSize = size,
                 };
             }
 
@@ -1345,31 +1371,7 @@ fn JournalWriter(comptime io: std.Io) type {
         };
 
         pub fn startWriteChunks(self: *Self) !ChunksWriter {
-            return try .init(&self.writer);
-        }
-
-        pub fn writeChunksNoFlush(self: *Self, chunkSets: HashChunkMap, onChunkWritten: anytype) !void {
-            var w = &self.writer.interface;
-
-            // type (1)
-            try w.writeByte(@intFromEnum(JournalRecordType.Chunks));
-            // number of chunks (4)
-            const chunkCount = chunkSets.count();
-            try w.writeInt(u32, chunkCount, .big);
-            // write ~chunkCount as a verification (4)
-            try w.writeInt(u32, ~chunkCount, .big);
-            var hasher = std.hash.Crc32.init();
-            // chunks
-            var it = chunkSets.iterator();
-            while (it.next()) |entry| {
-                try chunks.serialize(entry.value_ptr.*, w);
-                const offset = self.writer.logicalPos() - entry.value_ptr.data.len;
-                const size: u32 = @intCast(entry.value_ptr.data.len);
-                try onChunkWritten.invoke(entry.key_ptr.*, offset, size);
-                hasher.update(&entry.key_ptr.bytes);
-            }
-            // crc32 (4)
-            try w.writeInt(u32, hasher.final(), .big);
+            return try .init(&self.writer, self.alloc);
         }
 
         const WriterContext = struct {
@@ -1384,9 +1386,9 @@ fn JournalWriter(comptime io: std.Io) type {
                 try ctx.bw.writeByte(byte);
                 ctx.hasher.update(&[_]u8{byte});
             }
-            fn writeInt(ctx: *@This(), comptime T: type, n: T) !void {
+            fn writeInt(ctx: *@This(), comptime T: type, n: T, endian: std.builtin.Endian) !void {
                 var buf: [@sizeOf(T)]u8 = undefined;
-                std.mem.writeInt(T, &buf, n, .big);
+                std.mem.writeInt(T, &buf, n, endian);
                 try ctx.bw.writeAll(&buf);
                 ctx.hasher.update(&buf);
             }
@@ -1416,11 +1418,11 @@ fn JournalWriter(comptime io: std.Io) type {
             // type (1)
             try w.writeByte(@intFromEnum(JournalRecordType.Index));
             // count (8)
-            try w.writeInt(u64, header.count);
+            try w.writeInt(u64, header.count, .big);
             // level (4)
-            try w.writeInt(u32, header.level);
+            try w.writeInt(u32, header.level, .big);
             // next (8)
-            try w.writeInt(u64, header.next);
+            try w.writeInt(u64, header.next, .big);
             // header crc (4)
             const header_crc32 = hasher.final();
             try base_writer.writeInt(u32, header_crc32, .big);
@@ -1440,23 +1442,26 @@ fn JournalWriter(comptime io: std.Io) type {
                 return error.SuffixsLenInvalid;
             }
             var hasher = std.hash.Crc32.init();
-            var w = WriterContext{ .bw = base_writer, .hasher = &hasher };
+            var w = WriterContext{
+                .bw = base_writer,
+                .hasher = &hasher,
+            };
 
             // type (1)
             try w.writeByte(@intFromEnum(JournalRecordType.Index));
             // count (8)
-            try w.writeInt(u64, index.count);
+            try w.writeInt(u64, index.count, .big);
             // level (4)
-            try w.writeInt(u32, index.level);
+            try w.writeInt(u32, index.level, .big);
             // next (8)
-            try w.writeInt(u64, index.next);
+            try w.writeInt(u64, index.next, .big);
             // header crc (4)
             const header_crc32 = hasher.final();
             try base_writer.writeInt(u32, header_crc32, .big);
             hasher = .init();
             // prefix
             for (index.prefixs) |prefix| {
-                try w.writeInt(u64, prefix);
+                try w.writeInt(u64, prefix, .big);
             }
             // suffix
             for (index.suffixs) |suffix| {
@@ -1464,8 +1469,7 @@ fn JournalWriter(comptime io: std.Io) type {
             }
             // refs
             for (index.refs) |ref| {
-                try w.writeInt(u64, ref.offset);
-                try w.writeInt(u32, ref.size);
+                try ref.writeTo(&w);
             }
             // crc32
             const crc32 = hasher.final();
@@ -1545,10 +1549,11 @@ fn JournalReader(comptime io: std.Io) type {
                 const h = try Hash.fromReader(r);
                 hasher.update(&h.bytes);
                 //size
-                const chunkSize = try r.takeInt(u32, .big);
+                const compressedSize = try r.takeInt(u32, .big);
+                const rawSize = try r.takeInt(u32, .big);
                 //data
-                const expectPos = self.reader.logicalPos() + chunkSize;
-                try chunkConsumer.invoke(h, chunkSize, &self.reader);
+                const expectPos = self.reader.logicalPos() + compressedSize;
+                try chunkConsumer.invoke(h, compressedSize, rawSize, &self.reader);
                 if (self.reader.logicalPos() != expectPos) {
                     @panic("read chunk contract is violated");
                 }
@@ -1808,6 +1813,7 @@ test "test journal writer and reader" {
     }
 
     var cw = try w.startWriteChunks();
+    defer cw.deinit();
     var iter = chunkSet.valueIterator();
     while (iter.next()) |c| {
         _ = try cw.write(c.*);
@@ -1823,17 +1829,20 @@ test "test journal writer and reader" {
     try r.reader.seekTo(0);
     const ChunkConsumer = struct {
         chunkSet: *HashChunkMap,
-        fn invoke(self: *@This(), h: Hash, chunkSize: u32, fileReader: *std.Io.File.Reader) !void {
-            var ri = &fileReader.interface;
-            const buf = try testing.allocator.alloc(u8, chunkSize);
-            try ri.readSliceAll(buf);
-            const dataChunk = Chunk.moveInit(buf);
+        ds: *chunks.ChunkDeserializer,
+        fn invoke(self: *@This(), h: Hash, compressedSize: u32, rawSize: u32, fileReader: *std.Io.File.Reader) !void {
+            const dataChunk = try self.ds.deserializeData(&fileReader.interface, compressedSize, rawSize);
             defer dataChunk.deinit(alloc);
             try testing.expect(h.equals(dataChunk.getHash()));
             try testing.expect(self.chunkSet.contains(h));
         }
     };
-    var consumer = ChunkConsumer{ .chunkSet = &chunkSet };
+    var ds = chunks.ChunkDeserializer.init(alloc);
+    defer ds.deinit();
+    var consumer = ChunkConsumer{
+        .chunkSet = &chunkSet,
+        .ds = &ds,
+    };
     try r.readChunks(&consumer);
     const rootRead = try r.readRoot();
     try testing.expectEqual(Hash.of("a"), rootRead);
@@ -1880,14 +1889,17 @@ test "test index init" {
     try refs.put(try Hash.parse("00100000000000000000000000000003"), .{
         .offset = 0,
         .size = 10,
+        .rawSize = 10,
     });
     try refs.put(try Hash.parse("00200000000000000000000000000002"), .{
         .offset = 10,
         .size = 20,
+        .rawSize = 20,
     });
     try refs.put(try Hash.parse("00300000000000000000000000000001"), .{
         .offset = 30,
         .size = 30,
+        .rawSize = 30,
     });
     const idx = try Index.init(alloc, refs);
     defer idx.deinit();
@@ -1923,26 +1935,32 @@ test "index read/write" {
     try refs.put(h1, .{
         .offset = 0,
         .size = 10,
+        .rawSize = 10,
     });
     try refs.put(h11, .{
         .offset = 0,
         .size = 10,
+        .rawSize = 10,
     });
     try refs.put(h2, .{
         .offset = 10,
         .size = 20,
+        .rawSize = 20,
     });
     try refs.put(h21, .{
         .offset = 10,
         .size = 20,
+        .rawSize = 20,
     });
     try refs.put(h22, .{
         .offset = 10,
         .size = 20,
+        .rawSize = 20,
     });
     try refs.put(h3, .{
         .offset = 30,
         .size = 30,
+        .rawSize = 30,
     });
     const idx = try Index.init(alloc, refs);
     defer idx.deinit();
@@ -2109,9 +2127,21 @@ test "index read/write" {
         defer searchPairs.clearAndFree(alloc);
         // test with already-found entries (ref.isValid() == true) mixed in
         // h1 already found (valid ref), h2 not found, h3 already found
-        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef{ .offset = 0, .size = 10 } }); // already valid
-        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef{ .offset = 0, .size = 0 } }); // not found
-        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef{ .offset = 30, .size = 30 } }); // already valid
+        try searchPairs.append(alloc, .{ .h = h1, .ref = ChunkRef{
+            .offset = 0,
+            .size = 10,
+            .rawSize = 10,
+        } }); // already valid
+        try searchPairs.append(alloc, .{ .h = h2, .ref = ChunkRef{
+            .offset = 0,
+            .size = 0,
+            .rawSize = 0,
+        } }); // not found
+        try searchPairs.append(alloc, .{ .h = h3, .ref = ChunkRef{
+            .offset = 30,
+            .size = 30,
+            .rawSize = 30,
+        } }); // already valid
 
         try r.reader.seekTo(0);
         const found4 = try header.searchMany(alloc, searchPairs.items);

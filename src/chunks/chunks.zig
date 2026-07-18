@@ -88,64 +88,89 @@ pub const ChunkWriter = struct {
     }
 };
 
-// /*
-//   Chunk Serialization:
-//     Chunk 0
-//     Chunk 1
-//      ..
-//     Chunk N
-
-//   Chunk:
-//     Hash  // 20-byte hash
-//     Len   // 4-byte int
-//     Data  // len(Data) == Len
-// */
-
-pub fn serialize(chunk: Chunk, writer: anytype) !void {
-    std.debug.assert(!chunk.isEmpty());
-
-    const h = chunk.getHash();
-    try writer.writeAll(&h.bytes);
-
-    const chunkSize: u32 = @intCast(chunk.data.len);
-    try writer.writeInt(u32, chunkSize, .big);
-
-    try writer.writeAll(chunk.data);
-}
-
-pub const ChunkDeserializer = struct {
-    allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
-
-    pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader) ChunkDeserializer {
-        return .{ .allocator = allocator, .reader = reader };
-    }
-
-    pub fn next(self: *ChunkDeserializer) !?Chunk {
-        const c = deserializeChunk(self.allocator, self.reader) catch |err| {
-            if (err == error.EndOfStream) return null;
-            return err;
+pub const ChunkSerializer = struct {
+    alloc: std.mem.Allocator,
+    compressionBuffer: std.ArrayList(u8),
+    pub fn init(alloc: std.mem.Allocator) ChunkSerializer {
+        return .{
+            .alloc = alloc,
+            .compressionBuffer = .empty,
         };
-        return c;
+    }
+    pub fn deinit(self: *ChunkSerializer) void {
+        self.compressionBuffer.deinit(self.alloc);
+    }
+    pub fn serialize(self: *ChunkSerializer, chunk: Chunk, writer: *std.Io.Writer) !u32 {
+        std.debug.assert(!chunk.isEmpty());
+
+        const h = chunk.getHash();
+        try writer.writeAll(&h.bytes);
+
+        const max_compressed_size: usize = @intCast(lz4.LZ4_compressBound(@intCast(chunk.data.len)));
+        try self.compressionBuffer.resize(self.alloc, max_compressed_size);
+        const compressedSize: u32 = @intCast(lz4.LZ4_compress_default(
+            @ptrCast(chunk.data.ptr),
+            @ptrCast(self.compressionBuffer.items.ptr),
+            @intCast(chunk.data.len),
+            @intCast(max_compressed_size),
+        ));
+        try writer.writeInt(u32, compressedSize, .big);
+
+        const rawSize: u32 = @intCast(chunk.data.len);
+        try writer.writeInt(u32, rawSize, .big);
+
+        try writer.writeAll(self.compressionBuffer.items[0..compressedSize]);
+        return compressedSize;
     }
 };
 
-fn deserializeChunk(alc: std.mem.Allocator, reader: *std.Io.Reader) !Chunk {
-    var h = Hash.Empty;
-    try reader.readSliceAll(&h.bytes);
+pub const ChunkDeserializer = struct {
+    alloc: std.mem.Allocator,
+    compressedBuffer: std.ArrayList(u8),
 
-    const chunkSize = try reader.takeInt(u32, .big);
-
-    const data = try alc.alloc(u8, chunkSize);
-    errdefer alc.free(data);
-    try reader.readSliceAll(data);
-
-    const c = Chunk.moveInit(data);
-    if (!c.getHash().equals(h)) {
-        return error.HashMismatch;
+    pub fn init(allocator: std.mem.Allocator) ChunkDeserializer {
+        return .{
+            .alloc = allocator,
+            .compressedBuffer = .empty,
+        };
     }
-    return c;
-}
+
+    pub fn deinit(self: *@This()) void {
+        self.compressedBuffer.deinit(self.alloc);
+    }
+
+    pub fn deserialize(self: *ChunkDeserializer, reader: *std.Io.Reader) !Chunk {
+        var h = Hash.Empty;
+        try reader.readSliceAll(&h.bytes);
+
+        const compressedSize = try reader.takeInt(u32, .big);
+        const rawSize = try reader.takeInt(u32, .big);
+
+        const c = try self.deserializeData(reader, compressedSize, rawSize);
+        errdefer c.deinit(self.alloc);
+        if (!c.getHash().equals(h)) {
+            return error.HashMismatch;
+        }
+        return c;
+    }
+
+    pub fn deserializeData(self: *ChunkDeserializer, reader: *std.Io.Reader, compressedSize: u32, rawSize: u32) !Chunk {
+        try self.compressedBuffer.resize(self.alloc, compressedSize);
+        try reader.readSliceAll(self.compressedBuffer.items);
+
+        const data = try self.alloc.alloc(u8, rawSize);
+        const decompressedLen: u32 = @intCast(lz4.LZ4_decompress_safe(
+            @ptrCast(self.compressedBuffer.items.ptr),
+            @ptrCast(data.ptr),
+            @intCast(compressedSize),
+            @intCast(rawSize),
+        ));
+        if (rawSize != decompressedLen) {
+            return error.DecompressedLenNotMatchRawSize;
+        }
+        return Chunk.moveInit(data);
+    }
+};
 
 const testing = std.testing;
 
@@ -180,44 +205,66 @@ test "test serialize" {
     var w = std.Io.Writer.Allocating.init(alc);
     defer w.deinit();
 
-    // first chunk
+    // ==========================================
+    // First Chunk: "abc123"
+    // ==========================================
     const data = "abc123";
     const chunk = try Chunk.init(alc, data);
     defer chunk.deinit(alc);
-    try serialize(chunk, &w.writer);
 
-    const written1 = w.written();
-    try testing.expectEqual(@as(usize, 30), written1.len);
+    var srz = ChunkSerializer.init(alc);
+    defer srz.deinit();
+
+    // serialize returns the dynamic compressedSize
+    const compSize1 = try srz.serialize(chunk, &w.writer);
+
+    var written1 = w.written();
+    // Layout check: 20 (Hash) + 4 (compSize) + 4 (rawSize) + compSize1
+    const expected_len1 = 20 + 4 + 4 + compSize1;
+    try testing.expectEqual(@as(usize, expected_len1), written1.len);
+
+    // 1. Verify Hash
     try testing.expectEqualSlices(u8, &chunk.getHash().bytes, written1[0..20]);
-    const size1 = std.mem.readInt(u32, written1[20..24], .big);
-    try testing.expectEqual(@as(u32, 6), size1);
-    try testing.expectEqualSlices(u8, data, written1[24..30]);
 
-    // second chunk
+    // 2. Verify compressedSize metadata
+    const size1 = std.mem.readInt(u32, written1[20..24], .big);
+    try testing.expectEqual(@as(u32, compSize1), size1);
+
+    // 3. Verify rawSize metadata
+    const rawSize1 = std.mem.readInt(u32, written1[24..28], .big);
+    try testing.expectEqual(@as(u32, data.len), rawSize1);
+
+    // 4. Verify Payload is compressed (should match our buffer)
+    try testing.expectEqualSlices(u8, srz.compressionBuffer.items[0..compSize1], written1[28 .. 28 + compSize1]);
+
+    // ==========================================
+    // Second Chunk: "日本語"
+    // ==========================================
     const data2 = "日本語";
     const chunk2 = try Chunk.init(alc, data2);
     defer chunk2.deinit(alc);
-    try serialize(chunk2, &w.writer);
 
-    const written2 = w.written();
-    const offset = 30;
-    try testing.expectEqual(@as(usize, offset + 20 + 4 + data2.len), written2.len);
+    const compSize2 = try srz.serialize(chunk2, &w.writer);
+
+    var written2 = w.written();
+    const offset = expected_len1; // Start of the second chunk
+
+    const expected_len2 = offset + 20 + 4 + 4 + compSize2;
+    try testing.expectEqual(@as(usize, expected_len2), written2.len);
+
+    // 1. Verify Hash
     try testing.expectEqualSlices(u8, &chunk2.getHash().bytes, written2[offset..][0..20]);
+
+    // 2. Verify compressedSize metadata
     const size2 = std.mem.readInt(u32, written2[offset + 20 ..][0..4], .big);
-    try testing.expectEqual(@as(u32, data2.len), size2);
-    try testing.expectEqualSlices(u8, data2, written2[offset + 24 ..]);
-}
+    try testing.expectEqual(@as(u32, compSize2), size2);
 
-test "test deserializer empty" {
-    const alc = testing.allocator;
-    var w = std.Io.Writer.Allocating.init(alc);
-    defer w.deinit();
+    // 3. Verify rawSize metadata
+    const rawSize2 = std.mem.readInt(u32, written2[offset + 24 ..][0..4], .big);
+    try testing.expectEqual(@as(u32, data2.len), rawSize2);
 
-    var reader = std.Io.Reader.fixed(w.written());
-
-    var deserializer = ChunkDeserializer.init(alc, &reader);
-    const result = try deserializer.next();
-    try testing.expectEqual(@as(?Chunk, null), result);
+    // 4. Verify Payload
+    try testing.expectEqualSlices(u8, srz.compressionBuffer.items[0..compSize2], written2[offset + 28 ..]);
 }
 
 test "test deserializer single chunk" {
@@ -228,23 +275,25 @@ test "test deserializer single chunk" {
     const chunk = try Chunk.init(alc, data);
     defer chunk.deinit(alc);
 
+    var srz = ChunkSerializer.init(alc);
+    defer srz.deinit();
+
     var w = std.Io.Writer.Allocating.init(alc);
     defer w.deinit();
-    try serialize(chunk, &w.writer);
+    _ = try srz.serialize(chunk, &w.writer);
 
     // deserialize
     const written = w.written();
     var reader = std.Io.Reader.fixed(written);
-    var deserializer = ChunkDeserializer.init(alc, &reader);
+    var deserializer = ChunkDeserializer.init(alc);
+    defer deserializer.deinit();
 
-    const c = try deserializer.next();
-    try testing.expect(c != null);
-    defer c.?.deinit(alc);
-    try testing.expectEqualSlices(u8, data, c.?.getData());
-    try testing.expect(chunk.getHash().equals(c.?.getHash()));
+    const c = try deserializer.deserialize(&reader);
+    defer c.deinit(alc);
+    try testing.expectEqualSlices(u8, data, c.getData());
+    try testing.expect(chunk.getHash().equals(c.getHash()));
 
-    // should be done
-    try testing.expectEqual(@as(?Chunk, null), try deserializer.next());
+    try testing.expectError(error.EndOfStream, reader.take(1));
 }
 
 test "test deserializer multiple chunks" {
@@ -255,24 +304,27 @@ test "test deserializer multiple chunks" {
     // serialize all chunks
     var w = std.Io.Writer.Allocating.init(alc);
     defer w.deinit();
+    var srz = ChunkSerializer.init(alc);
+    defer srz.deinit();
     for (chunks_data) |data| {
         const c = try Chunk.init(alc, data);
         defer c.deinit(alc);
-        try serialize(c, &w.writer);
+        _ = try srz.serialize(c, &w.writer);
     }
 
     // deserialize and verify round trip
     const written = w.written();
+
     var reader = std.Io.Reader.fixed(written);
-    var deserializer = ChunkDeserializer.init(alc, &reader);
+    var deserializer = ChunkDeserializer.init(alc);
+    defer deserializer.deinit();
 
     for (chunks_data) |expected_data| {
-        const c = try deserializer.next();
-        try testing.expect(c != null);
-        defer c.?.deinit(alc);
-        try testing.expectEqualSlices(u8, expected_data, c.?.getData());
+        const c = try deserializer.deserialize(&reader);
+        defer c.deinit(alc);
+        try testing.expectEqualSlices(u8, expected_data, c.getData());
     }
-    try testing.expectEqual(@as(?Chunk, null), try deserializer.next());
+    try testing.expectError(error.EndOfStream, reader.take(1));
 }
 
 test "test deserializer hash mismatch" {
@@ -284,15 +336,18 @@ test "test deserializer hash mismatch" {
     const data = "abc123";
     const chunk = try Chunk.init(alc, data);
     defer chunk.deinit(alc);
-    try serialize(chunk, &w.writer);
+    var srz = ChunkSerializer.init(alc);
+    defer srz.deinit();
+    _ = try srz.serialize(chunk, &w.writer);
 
     // flip first byte of hash
     const written = w.written();
     written[0] ^= 0xFF;
 
     var reader = std.Io.Reader.fixed(written);
-    var deserializer = ChunkDeserializer.init(alc, &reader);
-    try testing.expectError(error.HashMismatch, deserializer.next());
+    var deserializer = ChunkDeserializer.init(alc);
+    defer deserializer.deinit();
+    try testing.expectError(error.HashMismatch, deserializer.deserialize(&reader));
 }
 
 const lz4 = @import("lz4");
