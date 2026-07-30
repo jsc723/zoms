@@ -11,7 +11,7 @@ Currently, a single-file journal chunk store is mostly finished. The next step i
 - [x] Chunk
 - [x] Size Cache
 - [x] Chunk Store
-- [ ] Compression
+- [x] Compression
 - [ ] Types
 - [ ] Diff
 - [ ] Merge
