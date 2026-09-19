@@ -6,7 +6,7 @@ const encoding = @import("base32.zig");
 
 const ByteLen = 20;
 const StringLen = 32;
-const useNomsCompatibleHash = true; // todo make this a build option
+const useNomsCompatibleHash = false; // todo make this a build option
 
 pub const Hash = struct {
     bytes: [ByteLen]u8,
